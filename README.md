@@ -1,5 +1,8 @@
 # CENO
 
+[Project website](https://cladeteam.github.io/ceno.github.io/) ·
+[Hugging Face models](https://huggingface.co/collections/CladeTeam/ceno)
+
 **CENO** is a DNA foundation model family built on a Mamba / Attention / MoE hybrid backbone
 (Nemotron-H architecture), trained on genomic sequence with multi-species alignment (MSA)
 post-training. This repository contains the open-source **code** for three tasks:
@@ -47,7 +50,7 @@ scoring. See `ceno_model/README.md` for the `from_pretrained` details.
 ## Checkpoints
 
 Model weights are published on the HuggingFace Hub under the [`CladeTeam`](https://huggingface.co/CladeTeam)
-organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno-6a361ca49e030fe463f26546).
+organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno).
 There are **15 checkpoints** across two families:
 
 - **CENO** (base DNA foundation model, bfloat16): four sizes (80M / 300M / 600M / 1B) × three
@@ -71,7 +74,7 @@ the `auto_map` pointing at this package's modules, e.g.:
 }
 ```
 
-`generation/patch_vllm_for_dna.py` symlinks this repo's model code into a checkpoint dir so
+`generation/patch_vllm_for_dna.py` copies this repo's model code into a checkpoint dir so
 `trust_remote_code=True` resolves it.
 
 ## License

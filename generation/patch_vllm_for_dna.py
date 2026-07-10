@@ -110,21 +110,7 @@ def prepare_checkpoint(model_dir):
         print(f"  ERROR: {model_dir} does not exist!")
         sys.exit(1)
 
-    # ── Synchronize checked-in shared files ──
-    for fname in SHARED_FILES:
-        src = os.path.join(SHARED_CODE_DIR, fname)
-        dst = os.path.join(model_dir, fname)
-
-        if not os.path.exists(src):
-            print(f"  WARNING: shared file {src} not found, skipping")
-            continue
-
-        if os.path.islink(dst):
-            os.unlink(dst)
-        shutil.copy2(src, dst)
-        print(f"  Synced: {fname}")
-
-    # ── Ensure config.json has auto_map ──
+    # Validate the checkpoint before modifying any files in it.
     config_path = os.path.join(model_dir, "config.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
@@ -134,6 +120,26 @@ def prepare_checkpoint(model_dir):
             "CENO-P is an MSA scoring model and is supported only by the HuggingFace VEP path, not vLLM generation."
         )
 
+    # ── Synchronize checked-in shared files ──
+    for fname in SHARED_FILES:
+        src = os.path.join(SHARED_CODE_DIR, fname)
+        dst = os.path.join(model_dir, fname)
+
+        if not os.path.exists(src):
+            print(f"  WARNING: shared file {src} not found, skipping")
+            continue
+
+        # Preserve checkpoint-specific generation defaults.
+        if fname == "generation_config.json" and os.path.exists(dst):
+            print("  Kept: generation_config.json (checkpoint-specific)")
+            continue
+
+        if os.path.islink(dst):
+            os.unlink(dst)
+        shutil.copy2(src, dst)
+        print(f"  Synced: {fname}")
+
+    # ── Ensure config.json has auto_map ──
     changed = False
     if "auto_map" not in cfg:
         cfg["auto_map"] = {}

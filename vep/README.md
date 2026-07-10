@@ -21,6 +21,11 @@ is scored as more deleterious.
 | `run_traitgym.py` | Entry point for the TraitGym example (real run + `--self-test`). |
 | `data/traitgym_sample.csv` | A 24-variant balanced subset of TraitGym `mendelian_traits` for trying the real-run command. |
 
+The bundled sample is derived from the
+[`songlab-cal/TraitGym`](https://github.com/songlab-cal/TraitGym) benchmark,
+which is distributed under the MIT License. Please cite the upstream TraitGym
+publication when using these data.
+
 ## Packed-MSA input format
 
 Each sample is a `bytes` blob (so PyTorch's `default_collate` leaves it alone)
@@ -82,7 +87,7 @@ This repo ships code only. For a real run you must supply:
 
 - **CENO-P checkpoint** — a directory with `config.json` + `*.safetensors`
   whose `config.json` carries the `auto_map` to this repo's model modules (see
-  the top-level README → *Checkpoints*). Will be released separately.
+  the top-level README → *Checkpoints*).
 - **Human MSA zarr** — a zarr group keyed by chromosome, each an `(L, D)`
   uint8 array whose column 0 is the reference. (Produced upstream by the MSA
   pipeline.)

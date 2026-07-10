@@ -68,7 +68,7 @@ TRAITGYM_NEGATIVE = {"false"}
 
 
 # --------------------------------------------------------------------------- #
-# Column resolution helpers (from the internal run_all.py)
+# Column resolution helpers
 # --------------------------------------------------------------------------- #
 def _pick_column(df: pd.DataFrame, candidates: list, label: str) -> str:
     for name in candidates:
@@ -151,12 +151,12 @@ def run_self_test(args):
         # Build a tiny TraitGym-like CSV whose reference alleles match the synthetic MSA.
         n_pos, n_neg = 12, 12
         rows = []
-        base_pos = 1024
+        base_pos = 512
         for i in range(n_pos):
-            rows.append({"chrom": "1", "pos": base_pos + 1000 * i,
+            rows.append({"chrom": "1", "pos": base_pos + 100 * i,
                          "ref": "A", "alt": "C", "label": "True"})
         for i in range(n_neg):
-            rows.append({"chrom": "1", "pos": 2500 + 100 * i,
+            rows.append({"chrom": "1", "pos": 2300 + 100 * i,
                          "ref": "A", "alt": "G", "label": "False"})
         df = pd.DataFrame(rows)
 

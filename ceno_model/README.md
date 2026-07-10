@@ -23,14 +23,14 @@ model = AutoModelForCausalLM.from_pretrained("<ckpt_dir>", trust_remote_code=Tru
 tok = AutoTokenizer.from_pretrained("<ckpt_dir>", trust_remote_code=True)
 ```
 The checkpoint's `config.json` carries `auto_map` pointing at the modules above;
-`generation/patch_vllm_for_dna.py` symlinks this package's files into the ckpt dir.
+`generation/patch_vllm_for_dna.py` copies this package's files into the ckpt dir.
 
 **B. As a Python package** (e.g. from the VEP adapter):
 ```python
 from ceno_model.ceno_hf import CENOConfig
 from ceno_model.ceno_hf.modeling_ceno_p import CENOPForCausalLM
 cfg = CENOConfig.from_pretrained("<ckpt_dir>")
-model = CENOPForCausalLM.from_pretrained("<ckpt_dir>", config=cfg, torch_dtype="bfloat16")
+model = CENOPForCausalLM.from_pretrained("<ckpt_dir>", config=cfg, torch_dtype="auto")
 ```
 
 ## Optional acceleration (env vars)
@@ -39,6 +39,12 @@ These are read by the VEP adapter:
 
 - `CENO_ATTN_IMPLEMENTATION=flash_attention_2` — FlashAttention-2.
 - `CENO_ENABLE_MAMBA_KERNELS=1` — Mamba CUDA fast path (needs `mamba_ssm` + `causal_conv1d`). This is required for CENO-P packed-MSA scoring because per-row state resets use the kernel path. Base CENO can fall back to PyTorch for slow single-sequence use.
+
+Install CUDA-compatible builds for the active PyTorch environment with:
+
+```bash
+pip install mamba-ssm causal-conv1d --no-build-isolation
+```
 
 ## Smoke test (no weights needed)
 

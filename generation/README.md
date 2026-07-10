@@ -43,7 +43,7 @@ What it does (idempotent):
 > only; CENO-P MSA scoring remains HuggingFace-only. When switching checkpoints in the same container,
 > re-run the patcher for the new dir (the vLLM source patch is not repeated).
 
-By default the patcher symlinks from `ceno_model/ceno_hf/` in this repo.
+By default the patcher copies from `ceno_model/ceno_hf/` in this repo.
 If you keep the model code elsewhere, set `CENO_SHARED_CODE_DIR`.
 
 ### 2. Generate

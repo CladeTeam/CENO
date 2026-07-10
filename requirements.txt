@@ -20,3 +20,5 @@ zarr>=2.18,<3
 # --- Optional, only for Mamba fast kernels (Part 1/2 scoring speedup) ---
 # CENO-P MSA scoring requires mamba-ssm + causal-conv1d on CUDA. Base CENO
 # can use the corrected PyTorch fallback, albeit much more slowly.
+# Install CUDA-compatible builds for the active PyTorch environment with:
+#   pip install mamba-ssm causal-conv1d --no-build-isolation
