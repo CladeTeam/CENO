@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.whl
+build/
+dist/
+.venv/
+venv/
+
+# Results / large outputs (VEP)
+results/
+*.json.bak
+detailed_scores.tsv
+progress.json
+
+# Checkpoints & large external data (NOT shipped in this repo)
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+# MSA zarr and reference FASTA are large external files
+*.zarr/
+*.fasta
+*.fa
+*.fa.gz
+
+# Editor / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store

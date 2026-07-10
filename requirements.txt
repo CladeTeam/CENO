@@ -1,0 +1,22 @@
+# Core: HuggingFace transformers + tokenizer/model code dependencies
+torch>=2.1,<2.7
+transformers==4.48.3
+accelerate>=0.34,<2
+numpy>=1.24,<3
+pandas>=2.0,<3
+tqdm>=4.66,<5
+scipy>=1.10,<2
+scikit-learn>=1.3,<2
+biopython>=1.83,<2
+
+# VEP data layer
+zarr>=2.18,<3
+
+# --- Optional, only for Part 3 (generation demo) ---
+# vLLM is heavy and GPU-only; install separately, e.g.:
+#   pip install -r requirements-vllm.txt
+# FlashInfer backend is also recommended:
+#   VLLM_ATTENTION_BACKEND=FLASHINFER
+# --- Optional, only for Mamba fast kernels (Part 1/2 scoring speedup) ---
+# CENO-P MSA scoring requires mamba-ssm + causal-conv1d on CUDA. Base CENO
+# can use the corrected PyTorch fallback, albeit much more slowly.

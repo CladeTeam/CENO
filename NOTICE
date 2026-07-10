@@ -1,0 +1,21 @@
+CENO
+Copyright (c) 2025-2026 CENO Authors. All rights reserved.
+
+This product includes model code derived from NVIDIA's Nemotron-H
+HuggingFace implementation
+(https://github.com/NVIDIA/TransformerEngine, Nemotron-H architecture),
+which is licensed under the Apache License, Version 2.0.
+
+The CENO model code (configuration, modeling, tokenizer modules under
+`ceno_model/ceno_hf/`) is derived from NVIDIA's Nemotron-H reference
+implementation and is distributed under the same Apache License, Version 2.0,
+included in this distribution as the `LICENSE` file.
+
+The tokenizer module is derived from Arc Institute's Evo2 CharLevelTokenizer,
+also distributed under the Apache License, Version 2.0. Its upstream copyright
+notice is preserved in `ceno_model/ceno_hf/ceno_tokenizer.py`.
+
+Nemotron-H is © NVIDIA Corporation. CENO and CENO-P are derivative works that
+build on the Nemotron-H Mamba/Attention/MoE hybrid backbone and add
+multi-species alignment (MSA) post-training. All NVIDIA copyright notices and
+license terms are preserved as required by the Apache License, Version 2.0.

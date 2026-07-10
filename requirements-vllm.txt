@@ -1,0 +1,3 @@
+# vLLM is optional and GPU-only. Keep this separate from the CPU/HF stack.
+# The CENO patcher targets this API family; validate a new vLLM release before upgrading.
+vllm==0.8.5.post1

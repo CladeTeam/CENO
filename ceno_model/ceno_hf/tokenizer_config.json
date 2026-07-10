@@ -1,0 +1,26 @@
+{
+  "tokenizer_class": "CENOCharLevelTokenizer",
+  "vocab_size": 512,
+  "eos_token": "<eos>",
+  "pad_token": "<pad>",
+  "unk_token": "<unk>",
+  "eod_id": 0,
+  "eos_id": 0,
+  "pad_id": 1,
+  "unk_id": 2,
+  "model_max_length": 1000000000000000019884624838656,
+  "clean_up_tokenization_spaces": true,
+  "tokenize_chinese_chars": false,
+  "strip_accents": null,
+  "do_lower_case": false,
+  "do_basic_tokenize": false,
+  "never_split": null,
+  "tokenizer_type": "CharLevelTokenizer",
+  "name_or_path": "./ceno_tokenizer",
+  "auto_map": {
+    "AutoTokenizer": [
+      "ceno_tokenizer.CENOCharLevelTokenizer",
+      null
+    ]
+  }
+}
