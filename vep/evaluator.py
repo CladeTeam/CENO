@@ -195,7 +195,7 @@ class VEPEvaluator:
         elif self.task_type == 2:
             return self._evaluate_classification(model, dataset, output_dir, progress_bar)
         else:
-            raise ValueError(f"Unknown task type: {task_type}")
+            raise ValueError(f"Unknown task type: {self.task_type}")
 
     
     def _evaluate_regression(self, 

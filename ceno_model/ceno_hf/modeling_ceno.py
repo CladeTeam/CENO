@@ -16,6 +16,7 @@
 # limitations under the License.
 """PyTorch CENO model."""
 
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
@@ -307,8 +308,11 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         return self.ssm_states[layer_idx]
 
     def reset(self):
-        self.conv_states.zero_()
-        self.ssm_states.zero_()
+        # conv_states / ssm_states are Python lists of tensors, not tensors.
+        for i in range(len(self.conv_states)):
+            self.conv_states[i].zero_()
+        for i in range(len(self.ssm_states)):
+            self.ssm_states[i].zero_()
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):
@@ -854,8 +858,15 @@ class CENOBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
     ):
-        with torch.cuda.stream(torch.cuda.default_stream(hidden_states.device)):
-            # * Use torch.cuda.stream() to avoid NaN issues when using multiple GPUs
+        # Use torch.cuda.stream() to avoid NaN issues when using multiple GPUs.
+        # Guarded by is_cuda because torch.cuda.default_stream() raises on CPU/MPS,
+        # which would otherwise break the documented PyTorch (CPU) fallback path.
+        _block_stream_ctx = (
+            torch.cuda.stream(torch.cuda.default_stream(hidden_states.device))
+            if hidden_states.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _block_stream_ctx:
             
             if self.block_type == "mamba":
                 # Mamba block: residual = x, output = x + mamba(norm(x))

@@ -1,11 +1,33 @@
-# CENO
+<div align="center">
 
-[Project website](https://cladeteam.github.io/ceno.github.io/) ·
-[Hugging Face models](https://huggingface.co/collections/CladeTeam/ceno)
+# 🧬 CENO
 
-**CENO** is a DNA foundation model family built on a Mamba / Attention / MoE hybrid backbone
-(Nemotron-H architecture), trained on genomic sequence with multi-species alignment (MSA)
-post-training. This repository contains the open-source **code** for three tasks:
+**One model that reads, scores, and writes DNA at genome scale.**
+
+*A genome-scale world model built on a Mamba / Attention / MoE hybrid backbone,
+trained with multi-species alignment (MSA) post-training.*
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97_Hugging_Face-CENO_Collection-yellow)](https://huggingface.co/collections/CladeTeam/ceno)
+[![Project page](https://img.shields.io/badge/Project-Website-2ea44f)](https://cladeteam.github.io/ceno.github.io/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](requirements.txt)
+
+[**Project page**](https://cladeteam.github.io/ceno.github.io/) ·
+[**Hugging Face models**](https://huggingface.co/collections/CladeTeam/ceno) ·
+[**Quickstart**](#-quickstart) ·
+[**Checkpoints**](#-checkpoints) ·
+[**Citation**](#-citation)
+
+</div>
+
+---
+
+## Overview
+
+**CENO** uses one long-context autoregressive model to **understand** long DNA,
+**score** the effect of mutations, and **design** new regulatory sequences —
+instead of building a separate tool for each task. This repository contains the
+open-source **code** for three tasks:
 
 | Part | Directory | What it does |
 |------|-----------|--------------|
@@ -13,11 +35,21 @@ post-training. This repository contains the open-source **code** for three tasks
 | 2. Variant Effect Prediction (VEP) | [`vep/`](vep) | HuggingFace-only VEP pipeline with a **TraitGym** worked example: load CENO-P → score WT vs. variant sequences (delta log-likelihood) → AUROC / AUPRC. |
 | 3. Generation demo | [`generation/`](generation) | vLLM offline inference demo (generation + embedding) for the pre-trained DNA model, including the patcher that wires this repo's model code into a checkpoint dir. |
 
+> [!NOTE]
 > **This repo ships code only.** Model weights live on the HuggingFace Hub — see
-> [Checkpoints](#checkpoints) below. The code is checkpoint-agnostic: point each part at a
+> [Checkpoints](#-checkpoints) below. The code is checkpoint-agnostic: point each part at a
 > checkpoint directory (`--model_dir`), either a Hub snapshot or a local checkout.
 
-## Quickstart
+## At a glance
+
+| | |
+|---|---|
+| **Context** | 8k → **1M tokens** (up to 1,048,576) long-context continuation |
+| **Sizes** | 80M / 300M / 600M / 1B parameters, one staged curriculum |
+| **One interface** | a single likelihood powers completion, perturbation, conditioning, and design |
+| **Efficiency** | ~8× faster long-context generation than Evo 2, with no out-of-memory failures |
+
+## 🚀 Quickstart
 
 ```bash
 pip install -r requirements.txt
@@ -45,9 +77,9 @@ cross-segment attention; `-` = let rows fuse) alternates isolation and fusion ac
 stack. The reference (human) sequence is the final `target` segment, so the model scores it
 after recurrently consuming the whole alignment. When `seq_idx` is omitted, the model degrades
 to ordinary causal-LM behavior — which is why the same package serves both generation and MSA
-scoring. See `ceno_model/README.md` for the `from_pretrained` details.
+scoring. See [`ceno_model/README.md`](ceno_model/README.md) for the `from_pretrained` details.
 
-## Checkpoints
+## 📦 Checkpoints
 
 Model weights are published on the HuggingFace Hub under the [`CladeTeam`](https://huggingface.co/CladeTeam)
 organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno).
@@ -76,6 +108,26 @@ the `auto_map` pointing at this package's modules, e.g.:
 
 `generation/patch_vllm_for_dna.py` copies this repo's model code into a checkpoint dir so
 `trust_remote_code=True` resolves it.
+
+## 📝 Citation
+
+If you use CENO in your research, please cite the technical report:
+
+```bibtex
+@misc{ceno2026,
+  title  = {CENO: A Genome-Scale World Model for
+            Evolutionary Sequence Interpretation and
+            Programmable Regulatory Design},
+  author = {{CENO Team}},
+  year   = {2026},
+  note   = {Technical report}
+}
+```
+
+When using the bundled VEP sample, please also cite the upstream
+[TraitGym](https://github.com/songlab-cal/TraitGym) benchmark (MIT License).
+
+For correspondence: `renyuchen@pjlab.org.cn` (Shanghai Artificial Intelligence Laboratory).
 
 ## License
 
