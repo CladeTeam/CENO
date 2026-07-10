@@ -37,8 +37,8 @@ open-source **code** for three tasks:
 
 > [!NOTE]
 > **This repo ships code only.** Model weights live on the HuggingFace Hub — see
-> [Checkpoints](#-checkpoints) below. The code is checkpoint-agnostic: point each part at a
-> checkpoint directory (`--model_dir`), either a Hub snapshot or a local checkout.
+> [Checkpoints](#-checkpoints) below. The code is checkpoint-agnostic: point the VEP and
+> generation entry points at a checkpoint — either a Hub id or a local directory.
 
 ## At a glance
 
@@ -83,18 +83,55 @@ scoring. See [`ceno_model/README.md`](ceno_model/README.md) for the `from_pretra
 
 Model weights are published on the HuggingFace Hub under the [`CladeTeam`](https://huggingface.co/CladeTeam)
 organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno).
-There are **15 checkpoints** across two families:
+There are **15 checkpoints** in two families:
 
-- **CENO** (base DNA foundation model, bfloat16): four sizes (80M / 300M / 600M / 1B) × three
-  training-context stages (`base` / `131k` / `1m`) = 12 checkpoints, e.g.
-  [`CladeTeam/CENO-300M-base`](https://huggingface.co/CladeTeam/CENO-300M-base).
-- **CENO-P** (MSA post-trained, float32): three sizes (300M / 600M / 1B), e.g.
-  [`CladeTeam/CENO-P-300M`](https://huggingface.co/CladeTeam/CENO-P-300M).
+- **CENO** — base DNA foundation model (bfloat16), for **generation** / single-sequence scoring.
+  Four sizes (80M / 300M / 600M / 1B) × three training-context stages (`base` / `131k` / `1m`)
+  = 12 checkpoints, e.g. [`CladeTeam/CENO-300M-base`](https://huggingface.co/CladeTeam/CENO-300M-base).
+- **CENO-P** — MSA post-trained (float32), for **variant-effect scoring** (see [`vep/`](vep)).
+  Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-300M`](https://huggingface.co/CladeTeam/CENO-P-300M).
 
-Each checkpoint directory loads standalone via `AutoModelForCausalLM.from_pretrained(...,
-trust_remote_code=True)` — the model code is bundled in the checkpoint dir. Alternatively, drop
-any checkpoint directory locally and pass its path as `--model_dir`. Its `config.json` carries
-the `auto_map` pointing at this package's modules, e.g.:
+Every checkpoint bundles this repo's model code, so it loads standalone with
+`trust_remote_code=True` — nothing else to set up.
+
+### Hardware
+
+CENO runs on any recent CUDA GPU — validated on **NVIDIA A100 and H100**, and works on other
+Ampere-or-newer cards. Multi-GPU is supported via `device_map="auto"`. CPU works for small
+smoke tests but is much slower.
+
+### Inference with HuggingFace (bfloat16)
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "CladeTeam/CENO-300M-base"          # any *base* CENO checkpoint
+tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,                # bf16 on A100 / H100
+    device_map="auto",
+).eval()
+
+input_ids = tok.encode("ATCG", return_tensors="pt").to(model.device)
+out = model.generate(
+    input_ids, max_new_tokens=128, do_sample=True, temperature=0.8, top_p=0.95
+)
+print(tok.decode(out[0], skip_special_tokens=True))
+```
+
+> [!TIP]
+> Use a **base** checkpoint for `model.generate()`. **CENO-P** is an MSA variant-effect
+> scorer — drive it through [`vep/`](vep), not `generate()`.
+
+<details>
+<summary>Loading a local checkpoint dir · <code>auto_map</code> details</summary>
+
+Instead of a Hub id you can pass a local directory to `from_pretrained` (or `--model_dir`).
+Each checkpoint's `config.json` carries the `auto_map` that points `trust_remote_code` at this
+package's modules:
 
 ```json
 {
@@ -108,6 +145,8 @@ the `auto_map` pointing at this package's modules, e.g.:
 
 `generation/patch_vllm_for_dna.py` copies this repo's model code into a checkpoint dir so
 `trust_remote_code=True` resolves it.
+
+</details>
 
 ## 📝 Citation
 
