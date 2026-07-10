@@ -87,9 +87,9 @@ There are **15 checkpoints** in two families:
 
 - **CENO** — base DNA foundation model (bfloat16), for **generation** / single-sequence scoring.
   Four sizes (80M / 300M / 600M / 1B) × three training-context stages (`base` / `131k` / `1m`)
-  = 12 checkpoints, e.g. [`CladeTeam/CENO-300M-base`](https://huggingface.co/CladeTeam/CENO-300M-base).
+  = 12 checkpoints, e.g. [`CladeTeam/CENO-1B-base`](https://huggingface.co/CladeTeam/CENO-1B-base).
 - **CENO-P** — MSA post-trained (float32), for **variant-effect scoring** (see [`vep/`](vep)).
-  Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-300M`](https://huggingface.co/CladeTeam/CENO-P-300M).
+  Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-600M`](https://huggingface.co/CladeTeam/CENO-P-600M).
 
 Every checkpoint bundles this repo's model code, so it loads standalone with
 `trust_remote_code=True` — nothing else to set up.
@@ -106,7 +106,7 @@ smoke tests but is much slower.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "CladeTeam/CENO-300M-base"          # any *base* CENO checkpoint
+model_id = "CladeTeam/CENO-1B-base"            # any *base* CENO checkpoint
 tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
