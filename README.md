@@ -1,6 +1,12 @@
 <div align="center">
 
-# 🧬 CENO
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/ceno-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/brand/ceno-banner-light.png">
+  <img alt="CENO — genome-scale world models" src="assets/brand/ceno-banner-light.png" width="560">
+</picture>
+
+# CENO
 
 **One model that reads, scores, and writes DNA at genome scale.**
 
