@@ -1,0 +1,11 @@
+FROM nvcr.io/nvidia/nemo:25.11.nemotron_3_nano
+
+RUN python3 -m pip install --no-cache-dir \
+    biopython \
+    bioframe \
+    pyBigWig \
+    "zarr<3" \
+    datasets \
+    openpyxl \
+    pyliftover
+RUN python3 -c "import Bio, bioframe, datasets, openpyxl, pyBigWig, pyliftover, zarr; from zarr.storage import LRUStoreCache; print('evaluation dependencies OK')"

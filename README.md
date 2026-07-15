@@ -21,6 +21,7 @@ trained with multi-species alignment (MSA) post-training.*
 [**Project page**](https://cladeteam.github.io/ceno.github.io/) ·
 [**Hugging Face models**](https://huggingface.co/collections/CladeTeam/ceno) ·
 [**Quickstart**](#-quickstart) ·
+[**Containers**](#-container-images) ·
 [**Checkpoints**](#-checkpoints) ·
 [**Citation**](#-citation)
 
@@ -72,6 +73,30 @@ python -m vep.run_traitgym --self-test
 
 For the real TraitGym VEP run you additionally need: a CENO-P checkpoint, the human MSA zarr, and
 the GRCh38 reference FASTA. See [`vep/README.md`](vep/README.md) for where each comes from.
+
+## 🐳 Container images
+
+This repository provides two Dockerfiles for the two supported inference paths. They use different
+base images and are intentionally kept separate.
+
+| Workflow | Dockerfile | Base image | Intended use |
+|----------|------------|------------|--------------|
+| vLLM generation | [`Dockerfile`](Dockerfile) | `vllm/vllm-openai:latest` | Fast GPU generation and embedding through [`generation/`](generation). Includes the build toolchain plus `causal-conv1d` and `mamba-ssm`. |
+| Hugging Face / VEP | [`Dockerfile.huggingface`](Dockerfile.huggingface) | `nvcr.io/nvidia/nemo:25.11.nemotron_3_nano` | Standard Hugging Face model loading and [`vep/`](vep) evaluation. Adds Biopython, bioframe, pyBigWig, Zarr 2.x, datasets, openpyxl, and pyliftover. |
+
+Build the image for the workflow you need:
+
+```bash
+# vLLM generation image
+docker build -f Dockerfile -t ceno-generation:latest .
+
+# Hugging Face loading and VEP evaluation image
+docker build -f Dockerfile.huggingface -t ceno-huggingface:latest .
+```
+
+Use a base CENO checkpoint with the generation image. Use the Hugging Face image for ordinary
+`from_pretrained` loading or CENO-P variant-effect scoring. See [`generation/README.md`](generation/README.md)
+and [`vep/README.md`](vep/README.md) for the corresponding commands and required data.
 
 ## Architecture in one paragraph
 
