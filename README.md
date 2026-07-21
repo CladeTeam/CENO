@@ -163,7 +163,10 @@ If you use CENO in your research, please cite the technical report:
   title  = {CENO: A Genome-Scale World Model for
             Evolutionary Sequence Interpretation and
             Programmable Regulatory Design},
-  author = {{CENO Team}},
+  author = {Ma, Mingqian and Wu, Yucheng and Chen, Xin and Jiang, Feifei and
+            Lin, Peijun and Ye, Dongxin and Sun, Yidi and Zhang, Yijing and
+            Shi, Tianqiong and Zhao, Yu and Ouyang, Wanli and Zhou, Bowen and
+            Bai, Lei and Ren, Yuchen},
   year   = {2026},
   note   = {Technical report}
 }
