@@ -201,9 +201,20 @@ class CENOConfig(PretrainedConfig):
         mamba_in_proj_layernorm=False,
         mamba_chunk_size=256,
         rescale_prenorm_residual=True,
+        ceno_training_precision=False,
+        ceno_mamba_gate_in_ssm=False,
+        ceno_rmsnorm_mode="torch",
+        ceno_reference_cp_size=1,
+        ceno_reference_context_length=None,
         intra_encoding_pattern=None,
         **kwargs,
     ):
+        # Explicit inference reference; never inferred from a serving batch or prefix.
+        self.ceno_training_precision = ceno_training_precision
+        self.ceno_mamba_gate_in_ssm = ceno_mamba_gate_in_ssm
+        self.ceno_rmsnorm_mode = ceno_rmsnorm_mode
+        self.ceno_reference_cp_size = ceno_reference_cp_size
+        self.ceno_reference_context_length = ceno_reference_context_length
         self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
         self.hidden_size = hidden_size

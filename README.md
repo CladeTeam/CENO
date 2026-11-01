@@ -54,7 +54,7 @@ open-source **code** for three tasks:
 | **Context** | 8k → **1M tokens** (up to 1,048,576) long-context continuation |
 | **Sizes** | 80M / 300M / 600M / 1B parameters, one staged curriculum |
 | **One interface** | a single likelihood powers completion, perturbation, conditioning, and design |
-| **Efficiency** | ~8× faster long-context generation than Evo 2, with no out-of-memory failures |
+| **Inference** | Corrected HF and vLLM paths; measured throughput and supported limits in [generation](generation/README.md#measured-performance) |
 
 ## 🚀 Quickstart
 
@@ -81,8 +81,8 @@ base images and are intentionally kept separate.
 
 | Workflow | Dockerfile | Base image | Intended use |
 |----------|------------|------------|--------------|
-| vLLM generation | [`Dockerfile`](Dockerfile) | `vllm/vllm-openai:latest` | Fast GPU generation and embedding through [`generation/`](generation). Includes the build toolchain plus `causal-conv1d` and `mamba-ssm`. |
-| Hugging Face / VEP | [`Dockerfile.huggingface`](Dockerfile.huggingface) | `nvcr.io/nvidia/nemo:25.11.nemotron_3_nano` | Standard Hugging Face model loading and [`vep/`](vep) evaluation. Adds Biopython, bioframe, pyBigWig, Zarr 2.x, datasets, openpyxl, and pyliftover. |
+| vLLM generation | [`Dockerfile`](Dockerfile) | `vllm/vllm-openai:v0.15.1` | Fast GPU generation and embedding through [`generation/`](generation). Uses the pinned vLLM integration and repository helpers. |
+| Hugging Face / VEP | [`Dockerfile.huggingface`](Dockerfile.huggingface) | `nvcr.io/nvidia/pytorch:25.03-py3` | Standard Hugging Face model loading and [`vep/`](vep) evaluation. Adds Biopython, bioframe, pyBigWig, Zarr 2.x, datasets, openpyxl, and pyliftover. |
 
 Build the image for the workflow you need:
 
@@ -114,7 +114,9 @@ scoring. See [`ceno_model/README.md`](ceno_model/README.md) for the `from_pretra
 
 Model weights are published on the HuggingFace Hub under the [`CladeTeam`](https://huggingface.co/CladeTeam)
 organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno).
-There are **15 checkpoints** in two families:
+The main collection has **15 checkpoints** in two families. The organization also
+hosts three legacy preview/CDS checkpoints; all 18 CENO repositories receive the
+applicable code fixes, with their own model and post-training behavior preserved:
 
 - **CENO** — base DNA foundation model (bfloat16), for **generation** / single-sequence scoring.
   Four sizes (80M / 300M / 600M / 1B) × three training-context stages (`base` / `131k` / `1m`)
@@ -123,13 +125,14 @@ There are **15 checkpoints** in two families:
   Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-600M`](https://huggingface.co/CladeTeam/CENO-P-600M).
 
 Every checkpoint bundles this repo's model code, so it loads standalone with
-`trust_remote_code=True` — nothing else to set up.
+`trust_remote_code=True` in the documented HF environment.
 
 ### Hardware
 
-CENO runs on any recent CUDA GPU — validated on **NVIDIA A100 and H100**, and works on other
-Ampere-or-newer cards. Multi-GPU is supported via `device_map="auto"`. CPU works for small
-smoke tests but is much slower.
+The corrected numerical reference was tested on **NVIDIA H200**, with one GPU, BF16
+and the pinned environments described in [generation](generation/README.md). Other
+GPU/build combinations are not covered by the bitwise guarantee. CPU supports small
+smoke tests. Multi-GPU placement is outside the corrected precision contract.
 
 ### Inference with HuggingFace (bfloat16)
 
@@ -143,7 +146,7 @@ model = AutoModelForCausalLM.from_pretrained(
     model_id,
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,                # bf16 on A100 / H100
-    device_map="auto",
+    device_map={"": 0},                       # supported precision path: one GPU
 ).eval()
 
 input_ids = tok.encode("ATCG", return_tensors="pt").to(model.device)
@@ -174,8 +177,8 @@ package's modules:
 }
 ```
 
-`generation/patch_vllm_for_dna.py` copies this repo's model code into a checkpoint dir so
-`trust_remote_code=True` resolves it.
+`generation/patch_vllm_for_dna.py` prepares an independent runtime copy for vLLM.
+Keep the downloaded checkpoint intact; see the generation guide.
 
 </details>
 
@@ -207,3 +210,13 @@ For correspondence: `renyuchen@pjlab.org.cn` (Shanghai Artificial Intelligence L
 Apache-2.0. The model code derives from NVIDIA's Nemotron-H HuggingFace implementation
 and the tokenizer derives from Arc Institute's Evo2 CharLevelTokenizer (both Apache-2.0).
 See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+## Current inference behavior
+
+The generation entry and standalone HF model files use one current implementation.
+Base CENO numerical fixes cover Mamba state/gating, MoE weighting, normalization,
+and attention. Model metadata specifies the supported numerical reference;
+CENO-P keeps its MSA-specific behavior and dtype. See [generation](generation/README.md)
+for environment and precision limits. Temperature is a sampling parameter, not a
+repair for backend disagreement. Use the repository or current Hub revision;
+older diagnostic archives are no longer the distribution channel.

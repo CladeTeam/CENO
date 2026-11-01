@@ -19,7 +19,7 @@
 import contextlib
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -58,16 +58,23 @@ from transformers.utils.import_utils import (
     is_mamba_2_ssm_available,    
 )
 try:
-    # Preferred import when using this repo as a package.
-    from ceno_hf.configuration_ceno import CENOConfig
-except Exception:
-    try:
-        # Fallback for relative import contexts.
-        from .configuration_ceno import CENOConfig
-    except Exception:
-        # Last resort for running from within the directory.
-        from configuration_ceno import CENOConfig
+    from .configuration_ceno import CENOConfig
+except ImportError:
+    import importlib
+    CENOConfig = getattr(importlib.import_module("configuration_ceno"), "CENOConfig")
 
+# Keep dependencies discoverable by HF's standalone module loader without
+# importing CUDA-only modules during CPU loading or conversion.
+if TYPE_CHECKING:
+    from .training_precision import configure_backend, enable_training_precision
+    from .ceno_norm import te_rms_norm
+    from .ceno_cp_math import combine
+
+
+def _precision_module():
+    import importlib
+    name = f"{__package__}.training_precision" if __package__ else "training_precision"
+    return importlib.import_module(name)
 
 logger = logging.get_logger(__name__)
 
@@ -308,11 +315,16 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         return self.ssm_states[layer_idx]
 
     def reset(self):
-        # conv_states / ssm_states are Python lists of tensors, not tensors.
-        for i in range(len(self.conv_states)):
-            self.conv_states[i].zero_()
-        for i in range(len(self.ssm_states)):
-            self.ssm_states[i].zero_()
+        """Release all sequence history before this cache is reused."""
+        for values in (self.conv_states, self.ssm_states):
+            for value in values:
+                value.zero_()
+        for values in (self.key_cache, self.value_cache):
+            for i, value in enumerate(values):
+                values[i] = value.new_empty((value.shape[0], 0))
+        self.has_previous_state = False
+        if hasattr(self, "_ceno_chunks"):
+            self._ceno_chunks.clear()
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):
@@ -433,6 +445,7 @@ class CENOMamba2Mixer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
     ):
+        gate_in_ssm = bool(getattr(self.config, "ceno_mamba_gate_in_ssm", False))
         # 1. Gated MLP's linear projection
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         hidden_states = self._maybe_apply_in_proj_norm(hidden_states)
@@ -486,12 +499,12 @@ class CENOMamba2Mixer(nn.Module):
                 B,
                 C,
                 D,
-                z=None,
+                z=gate.view(batch_size, self.num_heads, self.head_dim) if gate_in_ssm else None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
             )
             hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
-            hidden_states = self.norm(hidden_states, gate)
+            hidden_states = self.norm(hidden_states, None if gate_in_ssm else gate)
 
             # 4. Final linear projection
             out = self.out_proj(hidden_states)[:, None, ...]
@@ -568,7 +581,7 @@ class CENOMamba2Mixer(nn.Module):
                     C.view(batch_size, seq_len, self.n_groups, -1),
                     chunk_size=self.chunk_size,
                     D=self.D,
-                    z=None,
+                    z=gate.view(batch_size, seq_len, self.num_heads, self.head_dim) if gate_in_ssm else None,
                     seq_idx=seq_idx,
                     return_final_states=True,
                     dt_bias=self.dt_bias,
@@ -583,7 +596,7 @@ class CENOMamba2Mixer(nn.Module):
                 scan_output = scan_output.view(batch_size, seq_len, -1)
 
                 # Multiply "gate" branch and apply extra normalization layer
-                scan_output = self.norm(scan_output, gate)
+                scan_output = self.norm(scan_output, None if gate_in_ssm else gate)
 
                 # 4. Final linear projection
                 out = self.out_proj(scan_output)
@@ -773,7 +786,11 @@ class CENOMamba2Mixer(nn.Module):
             if ssm_state is not None and cache_params is not None:
                 cache_params.update_ssm_state(layer_idx=self.layer_idx, new_ssm_state=ssm_state)
 
-        scan_output = self.norm(y, gate)
+        if bool(getattr(self.config, "ceno_mamba_gate_in_ssm", False)):
+            y = (y.float() * nn.functional.silu(gate.float())).to(dtype)
+            scan_output = self.norm(y)
+        else:
+            scan_output = self.norm(y, gate)
 
         # end ssd naive
 
@@ -1041,6 +1058,7 @@ class CENOMoE(nn.Module):
         ])
         
     def forward(self, hidden_states):
+        router_softmax = getattr(self, "_ceno_router_softmax", torch.nn.functional.softmax)
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
         # Flatten for easier processing
@@ -1070,13 +1088,13 @@ class CENOMoE(nn.Module):
 
         if pre_softmax:
             # Pre-softmax routing: softmax over all experts, then take top-k.
-            probs = torch.nn.functional.softmax(router_logits, dim=-1)
+            probs = router_softmax(router_logits, dim=-1)
             routing_weights, selected_experts = torch.topk(probs, self.top_k, dim=-1)
             routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             # Post-topk softmax routing: take top-k logits first, then softmax over top-k.
             topk_logits, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
-            routing_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
+            routing_weights = router_softmax(topk_logits, dim=-1)
         
         # Initialize output
         final_hidden_states = torch.zeros_like(hidden_states_flat)
@@ -1300,7 +1318,8 @@ class CENOFlashAttention2(CENOAttention):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        attn_output = _flash_attention_forward(
+        attention_forward = getattr(self, "_ceno_attention", _flash_attention_forward)
+        attn_output = attention_forward(
             query_states,
             key_states,
             value_states,
@@ -1840,6 +1859,21 @@ class CENOModel(CENOPreTrainedModel):
 class CENOForCausalLM(CENOPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # Honor explicit caller precision; otherwise use the checkpoint's dtype.
+        if "dtype" not in kwargs:
+            kwargs.setdefault("torch_dtype", "auto")
+        config = kwargs.get("config")
+        preserve = (kwargs.get("attn_implementation") == "eager" or
+                    getattr(config, "_attn_implementation_internal", None) == "eager")
+        result = super().from_pretrained(*args, **kwargs)
+        model = result[0] if isinstance(result, tuple) else result
+        model._ceno_preserve_attention_backend = preserve
+        if getattr(model.config, "ceno_training_precision", False) and not preserve:
+            _precision_module().configure_backend()
+        return result
+
     def __init__(self, config):
         super().__init__(config)
         self.backbone = CENOModel(config)
@@ -1965,6 +1999,21 @@ class CENOForCausalLM(CENOPreTrainedModel, GenerationMixin):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        if (getattr(self.config, "ceno_training_precision", False)
+                and not self.training and not torch.is_grad_enabled()
+                and not output_attentions
+                and not getattr(self, "_ceno_preserve_attention_backend", False)
+                and self.device.type == "cuda" and self.dtype == torch.bfloat16
+                and not hasattr(self, "ceno_precision_reference")):
+            if seq_idx is not None:
+                raise ValueError("Base generation precision does not implement MSA segments")
+            precision_inputs = input_ids if input_ids is not None else inputs_embeds
+            if precision_inputs is not None and precision_inputs.shape[0] * precision_inputs.shape[1] > 131072:
+                raise ValueError("HF precision prefill budget is 131072 tokens; use vLLM for larger prefill")
+            if attention_mask is not None and not bool(torch.all(attention_mask)):
+                raise ValueError("HF precision requires unpadded uniform-length batches")
+            _precision_module().enable_training_precision(self)
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if cache_params is None and past_key_values is not None:

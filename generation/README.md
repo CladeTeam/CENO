@@ -1,102 +1,79 @@
-# generation — vLLM inference demo for CENO (DNA generation)
+# CENO inference
 
-A vLLM-based demo for **DNA sequence generation** (and embedding) with the
-pre-trained CENO model. This is the fast, batched alternative to
-`model.generate()` — for the MSA-based VEP scoring task use [`vep/`](../vep)
-(HuggingFace forward) instead.
+Use one current implementation: this directory, its nine `ceno_*.py` helpers,
+and `third_party/TransformerEngine-LICENSE`. Use the generation scripts in this repository.
 
-> vLLM is heavy and GPU-only — install the pinned integration with
-> `pip install -r requirements-vllm.txt` in a CUDA container. The patcher refuses
-> unvalidated vLLM versions. The FlashInfer attention backend is recommended but
-> can be overridden with `VLLM_ATTENTION_BACKEND`.
+## Environment and generation
 
-## Files
+Use vLLM **0.15.1**. `requirements-vllm.txt` and the Dockerfile agree on this
+version; upgrading to another release requires a matching integration.
+The full exact-reference evidence was collected on H200 with Torch 2.9.1+cu129.
+A matching package version alone is not a bitwise guarantee on every GPU/build.
 
-| File | Role |
-|------|------|
-| `patch_vllm_for_dna.py` | One-time patcher: synchronizes this repo's model/tokenizer files into a **base CENO** checkpoint, persists the vLLM-supported architecture identifier, and patches the pinned container-local vLLM source. |
-| `vllm_offline_infer.py` | Offline **generation** demo. |
-| `vllm_offline_embed.py` | Offline **embedding** demo. |
-
-## Quickstart (3 steps)
-
-### 1. Prepare a checkpoint dir
-
-Point the patcher at a CENO checkpoint directory (`config.json` + weights):
+Create an independent runtime copy of a downloaded base CENO checkpoint:
 
 ```bash
-python3 generation/patch_vllm_for_dna.py /path/to/ceno_checkpoint
+set -euo pipefail
+RUNTIME=$(mktemp -d /tmp/ceno-runtime.XXXXXX)
+cp -aL /path/to/checkpoint/. "$RUNTIME/"
+python3 generation/patch_vllm_for_dna.py "$RUNTIME"
+python3 generation/vllm_offline_infer.py "$RUNTIME" \
+  --prompts ATCGATCGATCG,GATTACAGATTACA --max-tokens 256 --temperature 0.8
 ```
 
-What it does (idempotent):
-1. Synchronizes this release's model/tokenizer files into the checkpoint so the
-   patched checkpoint remains standalone-loadable.
-2. Persists `architectures: ["NemotronHForCausalLM"]` for vLLM dispatch while
-   retaining CENO's `model_type` and HuggingFace `auto_map`.
-3. Patches the container's vLLM source to support the Nemotron-H architecture
-   (container-local; does not touch the host). vLLM's `nemotron_h.py` is vLLM's
-   own file, so its class names stay `NemotronH*` — only their bodies are patched.
-4. Registers `"ceno"` / `"CENOForCausalLM"` as aliases in vLLM's model registry so
-   a checkpoint with `model_type: "ceno"` dispatches to that same patched code.
+Current checkpoint configuration selects the inference arithmetic automatically.
+The patcher modifies the runtime and container-local vLLM, never source weights.
+Do not use hardlinked runtime copies. Keep all generation helpers beside the
+patcher. CENO-P is an HF MSA scorer, not a vLLM generation checkpoint.
 
-> **Patch before inferring.** This generation path supports base **CENO** checkpoints
-> only; CENO-P MSA scoring remains HuggingFace-only. When switching checkpoints in the same container,
-> re-run the patcher for the new dir (the vLLM source patch is not repeated).
+## Numerical contract
 
-By default the patcher copies from `ceno_model/ceno_hf/` in this repo.
-If you keep the model code elsewhere, set `CENO_SHARED_CODE_DIR`.
+The corrected path uses FP32 Mamba state, training-order gating and MoE weighting,
+fixed scan reductions, cache-owned chunk decode, fixed TE RMSNorm, and ordinary
+FA2 attention with an explicit CP reference. CP1 and CP8 Megatron references are
+not bitwise interchangeable. `ceno_reference_context_length` is fixed per model,
+never derived from the current batch or prefix.
 
-### 2. Generate
+Current precision support: BF16 CENO widths 512/1024, Mamba heads 16/32,
+attention heads 8/16, TP=PP=1, no quantization, prefix caching or speculation.
+Decode CUDA Graphs remain enabled; asynchronous scheduling and whole-model
+compilation are disabled. The CLI defaults to eight simultaneous requests; use `--max-num-seqs` to change it.
+Other architectures keep their ordinary compatible implementation and are not
+labeled training-precision validated. CENO-P uses the separate HF MSA path.
 
-```bash
-python3 generation/vllm_offline_infer.py /path/to/ceno_checkpoint \
-    --prompts "ATCGATCGATCG,GATTACAGATTACA" \
-    --max-tokens 256 \
-    --temperature 0.9
-```
+The precision path costs additional KV staging memory and scan work. Temperature
+changes sampling; it does not repair raw-logit disagreement or guarantee
+biological quality. Seeded sampling is not expected to produce identical random
+sequences across different inference engines.
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `model_dir` | (required) | checkpoint directory |
-| `--prompts` | built-in examples | comma-separated DNA prompts |
-| `--max-tokens` | 128 | max generation length (≈ HF `max_new_tokens`) |
-| `--temperature` | 0.8 | 0 = greedy, 0.8–1.0 = diverse sampling |
-| `--top-p` | 0.95 | nucleus sampling threshold |
-| `--top-k` | None | top-k sampling |
-| `--max-model-len` | 8192 | max model context length |
-| `--tp` | 1 | tensor-parallel size (multi-GPU) |
+## HF and validation
 
-Or inline in Python:
+HF standalone exports include their own relative-import helpers; vLLM is not an
+HF dependency. See [HF loading](../ceno_model/README.md). The HF precision path is single-GPU, BF16,
+inference-only, unpadded equal-length batches, with a 131072-token prefill budget.
+Use vLLM for larger prefills. The embedding CLI is retained but generation's
+bitwise-parity claims do not apply to embedding pooling.
 
-```python
-import os
-os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-from vllm import LLM, SamplingParams
+Existing c2 evidence: CP1 continuous 131072-step decode and CP8 1044480-token prefix +4096
+steps (1M tokens total) match their fixed Megatron BF16 references; HF evidence covers 4874 steps
+and a 131k prefix +64 steps. These are specific checks, not a claim that every
+published checkpoint has the same coverage. The README records the tested limits; historical diagnostic bundles are not required.
 
-llm = LLM(model="/path/to/ceno_checkpoint", trust_remote_code=True,
-          dtype="bfloat16", max_model_len=8192, enable_prefix_caching=False)
-outputs = llm.generate(["ATCGATCG", "GATTACA"],
-                       SamplingParams(temperature=0.8, top_p=0.95, max_tokens=128))
-for o in outputs:
-    print(o.prompt, "->", o.outputs[0].text)
-```
+## Measured performance
 
-### 3. (Optional) FP8 quantization — Hopper / Ada Lovelace GPUs
+Same H200, same 1B c2 weights, one full-length warm-up and median of three runs.
+Throughput includes prefill and decode, excludes model loading/compilation;
+batch-eight values count all generated tokens. The baseline is the previous
+shared implementation, which had numerical errors.
 
-W8A8 FP8 roughly halves memory and ~1.6× throughput, with **no pre-quantized
-checkpoint** needed — pass flags to use a BF16 checkpoint directly:
+| Prefix tokens | Batch | Generated tokens per request | Previous tokens/s | Current tokens/s | Change |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1 | 1024 | 441.75 | 361.27 | -18.2% |
+| 512 | 8 | 1024 | 2846.00 | 2451.51 | -13.9% |
+| 8192 | 1 | 1024 | 373.96 | 293.57 | -21.5% |
+| 8192 | 8 | 1024 | 2335.82 | 1726.41 | -26.1% |
+| 131072 | 1 | 256 | 84.53 | 74.44 | -11.9% |
 
-```bash
-python3 generation/vllm_offline_infer.py /path/to/ceno_checkpoint \
-    --quantization fp8 --kv-cache-dtype fp8
-```
-
-| Option | Effect | Applies to |
-|--------|--------|------------|
-| `--quantization fp8` | Linear-layer W8A8 | Attention proj, MoE/MLP |
-| `--kv-cache-dtype fp8` | FP8 KV cache | Attention layers |
-| — | Mamba SSM layers unaffected (no Linear / KV cache) | — |
-
-> Online dynamic quantization loads the model at full precision first — make
-> sure you have enough GPU memory for the full model. A100 (Ampere) supports
-> only weight-only W8A16 (Marlin), **not** W8A8.
+At the 131072-token prefix, decode alone improves from 110.87 to 118.14 tokens/s
+(+6.6%); time to first token increases from 0.728 to 1.281 seconds. These numbers
+are workload-specific and do not imply unchanged throughput for all models.

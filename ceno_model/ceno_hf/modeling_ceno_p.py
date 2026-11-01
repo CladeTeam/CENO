@@ -58,16 +58,10 @@ from transformers.utils.import_utils import (
     is_mamba_2_ssm_available,    
 )
 try:
-    # Preferred import when using this repo as a package.
-    from ceno_hf.configuration_ceno import CENOConfig
-except Exception:
-    try:
-        # Fallback for relative import contexts.
-        from .configuration_ceno import CENOConfig
-    except Exception:
-        # Last resort for running from within the directory.
-        from configuration_ceno import CENOConfig
-
+    from .configuration_ceno import CENOConfig
+except ImportError:
+    import importlib
+    CENOConfig = getattr(importlib.import_module("configuration_ceno"), "CENOConfig")
 
 logger = logging.get_logger(__name__)
 
@@ -308,11 +302,16 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         return self.ssm_states[layer_idx]
 
     def reset(self):
-        # conv_states / ssm_states are Python lists of tensors, not tensors.
-        for i in range(len(self.conv_states)):
-            self.conv_states[i].zero_()
-        for i in range(len(self.ssm_states)):
-            self.ssm_states[i].zero_()
+        """Release all sequence history before this cache is reused."""
+        for values in (self.conv_states, self.ssm_states):
+            for value in values:
+                value.zero_()
+        for values in (self.key_cache, self.value_cache):
+            for i, value in enumerate(values):
+                values[i] = value.new_empty((value.shape[0], 0))
+        self.has_previous_state = False
+        if hasattr(self, "_ceno_chunks"):
+            self._ceno_chunks.clear()
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):

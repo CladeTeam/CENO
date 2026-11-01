@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025-2026, CENO Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
-Patch vLLM for DNA CENO inference.
+Patch vLLM for DNA NemotronH inference.
 
 This script does three things:
-  1. Patches shared model code (ceno_tokenizer, tokenizer_config) — once
+  1. Patches shared model code (evo2_tokenizer, tokenizer_config) — once
   2. Prepares a checkpoint directory (symlinks shared files, ensures auto_map)
   3. Patches vLLM source code in the container
 
@@ -31,11 +17,15 @@ Usage:
     python3 generation/patch_vllm_for_dna.py <checkpoint_dir>
 
 Example:
-    python3 generation/patch_vllm_for_dna.py /path/to/ceno_checkpoint
+    python3 generation/patch_vllm_for_dna.py \
+        /mnt/shared-storage-user/dnacoding/nemotron_models_v2/hf/ablation/300M_A100M_stage2_v1_c2
 """
 
-import json
+import argparse
+import ast
+import hashlib
 import importlib.metadata
+import json
 import os
 import re
 import shutil
@@ -43,21 +33,24 @@ import subprocess
 import sys
 
 # ─────────────────────────────────────────────
-# Shared model code (tokenizer, config class, modeling).
-# Defaults to this repo's own ceno_model/ceno_hf package; override with
-# the CENO_SHARED_CODE_DIR env var if you keep the model code elsewhere.
+# Shared model code (tokenizer, config class, modeling)
 # ─────────────────────────────────────────────
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SHARED_CODE_DIR = os.environ.get(
-    "CENO_SHARED_CODE_DIR",
-    os.path.join(_REPO_ROOT, "ceno_model", "ceno_hf"),
+    "CENO_SHARED_CODE_DIR", os.path.join(os.path.dirname(__file__), "..", "ceno_model", "ceno_hf")
 )
-SUPPORTED_VLLM_VERSION = "0.8.5.post1"
+SUPPORTED_VLLM_VERSION = "0.15.1"
 
-# Files to synchronize from SHARED_CODE_DIR into each checkpoint.  The copy is
-# deliberate: a published checkpoint must remain standalone-loadable after the
-# local repository is removed.
+
+def validate_vllm_version():
+    version = importlib.metadata.version("vllm")
+    if version != SUPPORTED_VLLM_VERSION:
+        raise RuntimeError(f"This CENO patch requires vLLM {SUPPORTED_VLLM_VERSION}; found {version}")
+
+# Files to symlink from SHARED_CODE_DIR into each checkpoint
 SHARED_FILES = [
+    "training_precision.py",
+    "ceno_norm.py",
+    "ceno_cp_math.py",
     "configuration_ceno.py",
     "modeling_ceno.py",
     "ceno_tokenizer.py",
@@ -74,10 +67,24 @@ SHARED_FILES = [
 def patch_shared_code():
     print(f"[1/3] Patching shared code in {SHARED_CODE_DIR} ...")
 
-    # All shipped source files already use native Python token IDs.  Do not
-    # mutate shared source at inference time; checkpoint preparation below
-    # synchronizes the checked-in implementation instead.
-    print("  OK: shared tokenizer is release-ready")
+    # ── Fix ceno_tokenizer.py: numpy.uint8 → Python int ──
+    tok_path = os.path.join(SHARED_CODE_DIR, "ceno_tokenizer.py")
+    if os.path.exists(tok_path):
+        with open(tok_path, "r") as f:
+            src = f.read()
+        old_tok = "token_ids = list(np.fromstring(text, dtype=np.uint8))"
+        new_tok = ("# .tolist() converts numpy.uint8 → native Python int\n"
+                   "        # (required for vLLM's msgspec serialization)\n"
+                   "        token_ids = np.fromstring(text, dtype=np.uint8).tolist()")
+        if old_tok in src:
+            src = src.replace(old_tok, new_tok)
+            with open(tok_path, "w") as f:
+                f.write(src)
+            print("  Fixed: ceno_tokenizer.py (numpy.uint8 → int)")
+        else:
+            print("  OK: ceno_tokenizer.py (already fixed)")
+    else:
+        print(f"  WARNING: {tok_path} not found")
 
     # ── Fix tokenizer_config.json: AutoTokenizer format ──
     tc_path = os.path.join(SHARED_CODE_DIR, "tokenizer_config.json")
@@ -103,24 +110,16 @@ def patch_shared_code():
 # ═════════════════════════════════════════════
 # STEP 2: Prepare checkpoint directory
 # ═════════════════════════════════════════════
-def prepare_checkpoint(model_dir):
+def prepare_checkpoint(model_dir, ssm_cache_dtype="float32", mamba_gate_mode="checkpoint",
+                       rmsnorm_mode="checkpoint", reference_cp_size="checkpoint",
+                       reference_context_length=None):
     print(f"\n[2/3] Preparing checkpoint: {model_dir} ...")
 
     if not os.path.isdir(model_dir):
         print(f"  ERROR: {model_dir} does not exist!")
         sys.exit(1)
 
-    # Validate the checkpoint before modifying any files in it.
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    if cfg.get("architectures") == ["CENOPForCausalLM"]:
-        raise ValueError(
-            "CENO-P is an MSA scoring model and is supported only by the HuggingFace VEP path, not vLLM generation."
-        )
-
-    # ── Synchronize checked-in shared files ──
+    # ── Symlink shared files ──
     for fname in SHARED_FILES:
         src = os.path.join(SHARED_CODE_DIR, fname)
         dst = os.path.join(model_dir, fname)
@@ -129,38 +128,87 @@ def prepare_checkpoint(model_dir):
             print(f"  WARNING: shared file {src} not found, skipping")
             continue
 
-        # Preserve checkpoint-specific generation defaults.
-        if fname == "generation_config.json" and os.path.exists(dst):
-            print("  Kept: generation_config.json (checkpoint-specific)")
+        if fname.endswith(".py") and os.path.abspath(src) != os.path.abspath(dst):
+            if os.path.islink(dst):
+                os.unlink(dst)
+            shutil.copy2(src, dst)
+            print(f"  Updated runtime code: {fname}")
             continue
-
         if os.path.islink(dst):
-            os.unlink(dst)
-        shutil.copy2(src, dst)
-        print(f"  Synced: {fname}")
+            # Already a symlink — check if it points to the right place
+            if os.readlink(dst) == src:
+                continue
+            else:
+                os.remove(dst)
+                os.symlink(src, dst)
+                print(f"  Relinked: {fname}")
+        elif os.path.exists(dst):
+            # Real file exists — skip (don't overwrite checkpoint files)
+            continue
+        else:
+            os.symlink(src, dst)
+            print(f"  Linked: {fname}")
 
     # ── Ensure config.json has auto_map ──
-    changed = False
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    if cfg.get("architectures") == ["CENOPForCausalLM"]:
+        raise ValueError("CENO-P uses the HF MSA path, not vLLM generation")
+    changed = cfg.get("architectures") != ["NemotronHForCausalLM"]
+    cfg["architectures"] = ["NemotronHForCausalLM"]
+    if rmsnorm_mode not in ("checkpoint", "torch", "te-general", "te-tuned"):
+        raise ValueError(f"Unknown RMSNorm mode: {rmsnorm_mode}")
+    selected_norm = cfg.get("ceno_rmsnorm_mode", "torch") if rmsnorm_mode == "checkpoint" else rmsnorm_mode
+    if selected_norm not in ("torch", "te-general", "te-tuned"):
+        raise ValueError(f"Unsupported checkpoint RMSNorm mode: {selected_norm}")
+    if selected_norm.startswith("te-") and cfg.get("hidden_size") not in (512, 1024):
+        raise ValueError("The validated TE RMSNorm specialization requires hidden_size=512 or 1024")
+    if rmsnorm_mode != "checkpoint" and cfg.get("ceno_rmsnorm_mode") != rmsnorm_mode:
+        cfg["ceno_rmsnorm_mode"] = rmsnorm_mode
+        changed = True
+    if mamba_gate_mode not in ("checkpoint", "training", "inference"):
+        raise ValueError(f"Unknown Mamba gate mode: {mamba_gate_mode}")
+    # Training's memory-efficient scan gates before the BF16 output boundary.
+    # Older exports omit this numerical contract, so require an explicit choice
+    # rather than guessing the original training recipe for every checkpoint.
+    if mamba_gate_mode != "checkpoint":
+        gate_in_ssm = mamba_gate_mode == "training"
+        if cfg.get("ceno_mamba_gate_in_ssm") != gate_in_ssm:
+            cfg["ceno_mamba_gate_in_ssm"] = gate_in_ssm
+            changed = True
+    if reference_cp_size not in ("checkpoint", "1", "8", 1, 8):
+        raise ValueError("Reference CP size must be checkpoint, 1, or 8")
+    cp = cfg.get("ceno_reference_cp_size", 1)
+    if reference_cp_size != "checkpoint":
+        cp = int(reference_cp_size)
+        if cfg.get("ceno_reference_cp_size") != cp:
+            cfg["ceno_reference_cp_size"] = cp
+            changed = True
+        if cp == 1 and "ceno_reference_context_length" in cfg:
+            del cfg["ceno_reference_context_length"]
+            changed = True
+    if reference_context_length is not None:
+        if cp != 8:
+            raise ValueError("An explicit reference context is only used for CP8")
+        if cfg.get("ceno_reference_context_length") != reference_context_length:
+            cfg["ceno_reference_context_length"] = reference_context_length
+            changed = True
+    if cp not in (1, 8):
+        raise ValueError(f"Unsupported checkpoint reference CP size: {cp}")
+    if cp == 8:
+        length = cfg.get("ceno_reference_context_length")
+        if not isinstance(length, int) or length <= 0 or length % 1024:
+            raise ValueError("CP8 needs an explicit reference context divisible by 1024")
+        if selected_norm != "te-tuned" or not cfg.get("ceno_mamba_gate_in_ssm", False):
+            raise ValueError("CP8 requires te-tuned RMSNorm and the training Mamba gate")
     if "auto_map" not in cfg:
         cfg["auto_map"] = {}
         changed = True
 
     if "AutoConfig" not in cfg["auto_map"]:
         cfg["auto_map"]["AutoConfig"] = "configuration_ceno.CENOConfig"
-        changed = True
-    if "AutoModelForCausalLM" not in cfg["auto_map"]:
-        cfg["auto_map"]["AutoModelForCausalLM"] = "modeling_ceno.CENOForCausalLM"
-        changed = True
-    if "AutoTokenizer" not in cfg["auto_map"]:
-        cfg["auto_map"]["AutoTokenizer"] = ["ceno_tokenizer.CENOCharLevelTokenizer", None]
-        changed = True
-
-    # vLLM resolves the architecture in a fresh process.  Registering an alias
-    # in this patcher's Python process is therefore insufficient.  Persistently
-    # select vLLM's supported Nemotron-H implementation while retaining CENO's
-    # model_type and HF auto_map for normal Transformers loading.
-    if cfg.get("architectures") != ["NemotronHForCausalLM"]:
-        cfg["architectures"] = ["NemotronHForCausalLM"]
         changed = True
 
     # ── Fix stale vLLM alias fields ──
@@ -200,15 +248,20 @@ def prepare_checkpoint(model_dir):
                 cfg[key] = correct_head_dim
                 changed = True
 
-    # ── Force MoE router math to stay in model dtype (bf16), not fp32 ──
-    # Earlier debugging showed that fp32 router logits can change routing behavior
-    # enough to create a mismatch against native Megatron. For vLLM comparison we
-    # want the router to follow the model dtype path unless explicitly overridden
-    # elsewhere, so pin the checkpoint config to bfloat16 here.
-    router_dtype = str(cfg.get("moe_router_dtype", "") or "").lower()
-    if router_dtype != "bfloat16":
-        print(f"  Fixing moe_router_dtype: {cfg.get('moe_router_dtype')} -> bfloat16")
-        cfg["moe_router_dtype"] = "bfloat16"
+    # Router precision is checkpoint semantics, not a loader compatibility alias.
+    # In particular, replacing an explicit fp32 router with BF16 can change the
+    # selected experts. Missing/null values already mean model dtype in HF.
+    print(f"  Preserving moe_router_dtype: {cfg.get('moe_router_dtype')}")
+
+    # Unlike weights/router math, this is an inference cache policy. HF keeps
+    # the final Mamba scan state in FP32. BF16 recurrent updates accumulate
+    # rounding error over thousands of decode steps, even with identical input.
+    if ssm_cache_dtype not in ("float32", "bfloat16", "float16"):
+        raise ValueError(f"Unsupported SSM cache dtype: {ssm_cache_dtype}")
+    if cfg.get("mamba_ssm_cache_dtype") != ssm_cache_dtype:
+        print(f"  Setting mamba_ssm_cache_dtype: {cfg.get('mamba_ssm_cache_dtype')}"
+              f" -> {ssm_cache_dtype}")
+        cfg["mamba_ssm_cache_dtype"] = ssm_cache_dtype
         changed = True
 
     if changed:
@@ -278,15 +331,7 @@ def safe_replace(source, old, new, desc=""):
 
 
 def patch_vllm_source():
-    try:
-        installed_version = importlib.metadata.version("vllm")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError("vLLM is not installed. Install requirements-vllm.txt first.") from exc
-    if installed_version != SUPPORTED_VLLM_VERSION:
-        raise RuntimeError(
-            f"This patcher supports vLLM {SUPPORTED_VLLM_VERSION}; found {installed_version}. "
-            "Do not apply source patches to an unvalidated vLLM release."
-        )
+    validate_vllm_version()
     vllm_path = find_vllm_nemotron_h()
     print(f"\n[3/3] Patching vLLM source: {vllm_path} ...")
 
@@ -313,7 +358,24 @@ def patch_vllm_source():
     source = patch_expert_mapping(source)
     source = patch_non_gated_moe_flag(source)
     source = patch_model_final_norm(source)
+    source = patch_hf_rmsnorm_semantics(source)
     source = patch_get_max_n_routed_experts(source)
+
+    for helper_name in ("ceno_moe.py", "ceno_mamba.py", "ceno_norm.py",
+                        "ceno_chunk.py", "ceno_attention.py", "ceno_precision.py",
+                        "ceno_cp_math.py", "ceno_cp_decode.py", "ceno_cp_attention.py"):
+        helper = os.path.join(os.path.dirname(__file__), helper_name)
+        with open(helper) as helper_file:
+            helper_source = helper_file.read()
+        compile(helper_source, helper, "exec")
+        helper_target = os.path.join(os.path.dirname(vllm_path), "..", "layers", helper_name)
+        with open(helper_target, "w") as helper_file:
+            helper_file.write(helper_source)
+
+    license_dir = os.path.join(os.path.dirname(vllm_path), "..", "layers", "third_party")
+    os.makedirs(license_dir, exist_ok=True)
+    shutil.copy2(os.path.join(os.path.dirname(__file__), "third_party", "TransformerEngine-LICENSE"),
+                 os.path.join(license_dir, "TransformerEngine-LICENSE"))
 
     with open(vllm_path, "w") as f:
         f.write(source)
@@ -342,6 +404,7 @@ def patch_vllm_source():
         mixer_source = f.read()
 
     mixer_source = patch_mamba_mixer2_norm_semantics(mixer_source)
+    mixer_source = patch_mamba_gate_boundary(mixer_source)
 
     with open(mamba_mixer2_path, "w") as f:
         f.write(mixer_source)
@@ -355,82 +418,93 @@ def patch_vllm_source():
         shutil.copy2(mixer_backup_path, mamba_mixer2_path)
         sys.exit(1)
 
-    print("  OK: checkpoint architecture was persisted as NemotronHForCausalLM for vLLM dispatch")
+    conv_path = os.path.join(os.path.dirname(mamba_mixer2_path), "ops", "causal_conv1d.py")
+    conv_backup = conv_path + ".orig"
+    if not os.path.exists(conv_backup):
+        shutil.copy2(conv_path, conv_backup)
+    with open(conv_backup, "r") as f:
+        conv_source = patch_causal_conv1d_precision(f.read())
+    compile(conv_source, conv_path, "exec")
+    with open(conv_path, "w") as f:
+        f.write(conv_source)
+    print("  Patched: causal_conv1d prefill/decode FP32 products")
+    scan_targets = {
+        "ssd_bmm.py": {"_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}},
+        "ssd_chunk_scan.py": {"_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}},
+        "ssd_chunk_state.py": {
+            "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 4},
+            "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+        },
+        "ssd_state_passing.py": {"_state_passing_fwd_kernel": {"BLOCK_SIZE": 256}},
+    }
+    for name, targets in scan_targets.items():
+        path = os.path.join(os.path.dirname(conv_path), name)
+        backup = path + ".orig"
+        if not os.path.exists(backup):
+            shutil.copy2(path, backup)
+        with open(backup) as scan_file:
+            fixed = patch_scan_autotuning(scan_file.read(), targets)
+        compile(fixed, path, "exec")
+        with open(path, "w") as scan_file:
+            scan_file.write(fixed)
+        print(f"  Patched: fixed CENO scan configuration in {name}")
 
 
-def patch_vllm_registry():
-    """Register the "ceno" model_type + CENO architecture names as aliases.
-
-    Our open-source checkpoints carry ``model_type: "ceno"`` and
-    ``architectures: ["CENOForCausalLM"]`` (base) / ``["CENOPForCausalLM"]`` (CENO-P).
-    vLLM's model registry, however, knows the Nemotron-H implementation under its
-    original names (``"nemotron_h"`` / ``"NemotronHForCausalLM"``) — that file is
-    vLLM's own, so we patch its *body* but do NOT rename its classes. To let a
-    "ceno" checkpoint dispatch to that same (already-patched) Nemotron-H code, we
-    register CENO as an alias pointing at vLLM's NemotronHForCausalLM.
-
-    Defensive across vLLM versions: tries the known registry mechanisms and warns
-    (does not abort) if none is found, since the rest of the patch is still useful.
-    """
-    print("\n[3/3c] Registering CENO aliases in vLLM model registry ...")
-    try:
-        from vllm.model_executor.models import nemotron_h as vllm_nemotron_h
-        NemotronHForCausalLM = getattr(vllm_nemotron_h, "NemotronHForCausalLM", None)
-        if NemotronHForCausalLM is None:
-            print("  WARNING: NemotronHForCausalLM not found in vLLM's nemotron_h module; skipping registry alias")
-            return
-    except Exception as e:
-        print(f"  WARNING: could not import vLLM's nemotron_h module ({e}); skipping registry alias")
-        return
-
-    aliases = [
-        ("ceno", "CENOForCausalLM"),          # base model_type / architecture
-        ("CENOForCausalLM", "CENOForCausalLM"),
-        ("cenop", "CENOPForCausalLM"),        # CENO-P (no separate vLLM class —
-        ("CENOPForCausalLM", "CENOPForCausalLM"),  #  MSA path is HF-only; alias to base)
-    ]
-
-    registered = 0
-
-    # Mechanism 1: vLLM >= 0.6 ModelRegistry.register_model (architecture -> class).
-    try:
-        from vllm.model_executor.models.registry import ModelRegistry  # noqa: WPS433
-        for arch, _ in aliases:
-            try:
-                ModelRegistry.register_model(arch, NemotronHForCausalLM)
-                registered += 1
-            except Exception:
-                pass
-        if registered:
-            print(f"  Registered via ModelRegistry.register_model: {[a for a, _ in aliases][:registered]}")
-    except Exception:
-        pass
-
-    # Mechanism 2: vLLM's _VLLM_MODELS / _REGISTRY_MODELS architecture->class dict.
-    if not registered:
-        for dict_name in ("_VLLM_MODELS", "_REGISTRY_MODELS"):
-            try:
-                import vllm.model_executor.models.registry as reg  # noqa: WPS433
-                models = getattr(reg, dict_name, None)
-                if isinstance(models, dict):
-                    for arch, _ in aliases:
-                        models[arch] = NemotronHForCausalLM
-                    registered += len(aliases)
-                    print(f"  Registered via {dict_name}: {[a for a, _ in aliases]}")
-                    break
-            except Exception:
+def patch_scan_autotuning(source, targets):
+    """Pin reduction tiles in source so eager AND compiled execution use them."""
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    edits = []
+    found = set()
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in targets:
+            continue
+        for decorator in node.decorator_list:
+            if not (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "autotune"):
                 continue
+            configs = next((kw.value for kw in decorator.keywords if kw.arg == "configs"), None)
+            if not isinstance(configs, ast.List):
+                raise RuntimeError(f"Unsupported autotune list: {node.name}")
+            matches = [config for config in configs.elts if isinstance(config, ast.Call)
+                       and config.args and ast.literal_eval(config.args[0]) == targets[node.name]]
+            if len(matches) != 1:
+                raise RuntimeError(f"Missing unique CENO scan configuration: {node.name}")
+            begin = offsets[configs.lineno-1] + configs.col_offset
+            end = offsets[configs.end_lineno-1] + configs.end_col_offset
+            edits.append((begin, end, "[" + ast.get_source_segment(source, matches[0]) + "]"))
+            found.add(node.name)
+    if found != set(targets):
+        raise RuntimeError(f"Missing native scan kernels: {set(targets)-found}")
+    for begin, end, replacement in sorted(edits, reverse=True):
+        source = source[:begin] + replacement + source[end:]
+    return source
 
-    # Mechanism 3: model_type string alias (NemotronHConfig.model_type is "nemotron_h").
-    # Point our CENOConfig (loaded from the checkpoint) at the same registry entry by
-    # temporarily exposing model_type "nemotron_h" — handled at load time by the
-    # architecture aliases above, so nothing to do here.
-    if not registered:
-        print("  WARNING: no vLLM registry mechanism found; CENO dispatch may require "
-              "setting architectures to [\"NemotronHForCausalLM\"] in config.json.")
-    else:
-        print("  OK: CENO aliases registered (vLLM will dispatch 'ceno'/'CENOForCausalLM' "
-              "to the patched Nemotron-H implementation).")
+
+def patch_causal_conv1d_precision(source):
+    """Avoid BF16 product rounding before the FP32 convolution accumulator."""
+    old = "acc += matrix_x * matrix_w  # [BLOCK_N]"
+    new = "acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)  # [BLOCK_N]"
+    if source.count(new) == 2 and old not in source:
+        return source
+    if source.count(old) != 2:
+        raise RuntimeError(
+            "Unsupported causal_conv1d source: expected both prefill and decode products"
+        )
+    return source.replace(old, new)
+
+
+def patch_hf_rmsnorm_semantics(source):
+    """Match CENO's FP32 normalization AND weight multiplication before cast."""
+    if "class HFCompatRMSNorm" not in source:
+        raise RuntimeError("HF-compatible RMSNorm definition is missing")
+    source, count = re.subn(r"(?<![A-Za-z0-9_])RMSNorm\(", "HFCompatRMSNorm(", source)
+    if not count and "self.norm_f = HFCompatRMSNorm(" not in source:
+        raise RuntimeError("Unsupported NemotronH RMSNorm layout")
+    print(f"  Patched: {count} RMSNorm constructors to CENO FP32 weight-multiply semantics")
+    return source
 
 
 # ──────────────────────────────────────────────────
@@ -452,13 +526,21 @@ def patch_mamba_decoder_layer(source):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        from vllm.config import get_current_vllm_config
+        config = get_current_vllm_config().model_config.hf_config
+        self.ceno_rmsnorm_mode = getattr(config, 'ceno_rmsnorm_mode', 'torch')
+        if self.ceno_rmsnorm_mode not in ('torch', 'te-general', 'te-tuned'):
+            raise ValueError(f'Unsupported RMSNorm mode: {self.ceno_rmsnorm_mode}')
+        if self.ceno_rmsnorm_mode.startswith('te-') and hidden_size not in (512, 1024):
+            raise ValueError('TE RMSNorm requires hidden_size=512 or 1024')
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
+        if self.ceno_rmsnorm_mode != 'torch':
+            from vllm.model_executor.layers.ceno_norm import te_rms_norm
+            return te_rms_norm(hidden_states, self.weight, self.variance_epsilon,
+                               self.ceno_rmsnorm_mode)
+        from vllm.model_executor.layers.ceno_moe import ceno_rms_norm
+        return ceno_rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
 
 class NemotronHMambaDecoderLayer(nn.Module):
@@ -475,6 +557,8 @@ class NemotronHMambaDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.has_in_proj_norm = getattr(config, 'mamba_in_proj_layernorm', False)
+        from vllm.model_executor.layers.ceno_mamba import configure_invariant_scan
+        configure_invariant_scan()
 
         self.mixer = MambaMixer2(
             hidden_size=config.hidden_size,
@@ -493,6 +577,11 @@ class NemotronHMambaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
         )
+
+        self.mixer.ceno_gate_in_ssm = bool(getattr(config, 'ceno_mamba_gate_in_ssm', False))
+        self.mixer.ceno_dt_limit = tuple(getattr(config, 'time_step_limit', (0.0, float('inf'))))
+        if self.mixer.ceno_gate_in_ssm and self.mixer.tp_size != 1:
+            raise ValueError('Training Mamba gate boundary is currently validated for TP=1 only')
 
         if self.has_in_proj_norm:
             self.mixer.in_proj_norm = HFCompatRMSNorm(
@@ -618,6 +707,46 @@ def patch_mamba_mixer2_norm_semantics(source):
     return source
 
 
+def patch_mamba_gate_boundary(source):
+    """Opt-in training gate placement for CENO, preserving other Mamba models."""
+    if "# CENO training gate boundary" in source:
+        return source
+    replacements = (
+        (
+            "hidden_states = self.norm(ssm_output, gate)",
+            "# CENO training gate boundary\n"
+            "        hidden_states = self.norm(\n"
+            "            ssm_output, None if getattr(self, 'ceno_gate_in_ssm', False) else gate\n"
+            "        )",
+        ),
+        (
+            "gate = gate.to(torch.float32)\n        x = x * nn.functional.silu(gate)",
+            "if gate is not None:\n"
+            "            gate = gate.to(torch.float32)\n"
+            "            x = x * nn.functional.silu(gate)",
+        ),
+        (
+            "z=None,\n                dt_bias=self.dt_bias,",
+            "z=(projected_states[num_decodes:num_actual_tokens, :self.tped_intermediate_size]\n"
+            "                   .view(num_prefill_tokens, -1, self.head_dim)\n"
+            "                   if getattr(self, 'ceno_gate_in_ssm', False) else None),\n"
+            "                dt_bias=self.dt_bias,",
+        ),
+        (
+            "z=None,\n                dt_bias=dt_bias,",
+            "z=(projected_states[:num_decodes, :self.tped_intermediate_size]\n"
+            "                   .view(num_decodes, -1, self.head_dim)\n"
+            "                   if getattr(self, 'ceno_gate_in_ssm', False) else None),\n"
+            "                dt_bias=dt_bias,",
+        ),
+    )
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise RuntimeError(f"Unsupported Mamba gate source: expected one {old!r}")
+        source = source.replace(old, new)
+    return source
+
+
 def patch_attention_decoder_layer(source):
     pattern = re.compile(
         r"(class NemotronHAttentionDecoderLayer\(nn\.Module\):.*?)(?=\n\nALL_DECODER_LAYER_TYPES)",
@@ -681,110 +810,6 @@ def patch_attention_decoder_layer(source):
 '''
     source = source[:match.start()] + replacement + source[match.end():]
     print("  Patched: NemotronHAttentionDecoderLayer")
-    return source
-
-
-def patch_attention_module(source):
-    pattern = re.compile(
-        r"(class NemotronHAttention\(nn\.Module\):.*?)(?=\nclass NemotronHAttentionDecoderLayer)",
-        re.DOTALL,
-    )
-    match = pattern.search(source)
-    if not match:
-        print("  WARNING: Could not find NemotronHAttention")
-        return source
-
-    replacement = r'''class NemotronHAttention(nn.Module):
-    def __init__(
-        self,
-        config: NemotronHConfig,
-        layer_idx: int,
-        model_config: ModelConfig | None = None,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        if hasattr(config, "head_dim") and config.head_dim is not None:
-            self.head_dim = config.head_dim
-        else:
-            self.head_dim = config.hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        sliding_window = getattr(config, "sliding_window", None)
-
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            per_layer_sliding_window=sliding_window,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        # Megatron stores fused QKV in group-interleaved order:
-        # [Q_group0, K_group0, V_group0, Q_group1, K_group1, V_group1, ...].
-        # vLLM's default contiguous split assumes [Q_all, K_all, V_all], which
-        # is incorrect for this checkpoint family and changes the real inference
-        # result. Reconstruct grouped Q/K/V first, then flatten back to the
-        # layout expected by vLLM's Attention layer.
-        group_q_size = (self.num_heads // self.num_kv_heads) * self.head_dim
-        group_kv_size = self.head_dim
-        group_dim = group_q_size + group_kv_size + group_kv_size
-        qkv_grouped = qkv.view(qkv.shape[0], self.num_kv_heads, group_dim)
-        q, k, v = qkv_grouped.split(
-            [group_q_size, group_kv_size, group_kv_size], dim=-1
-        )
-        q = q.reshape(qkv.shape[0], -1)
-        k = k.reshape(qkv.shape[0], -1)
-        v = v.reshape(qkv.shape[0], -1)
-
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-'''
-    source = source[:match.start()] + replacement + source[match.end():]
-    print("  Patched: NemotronHAttention")
     return source
 
 
@@ -959,6 +984,14 @@ def patch_moe_class(source):
 
         # Detect MoE style: Mixtral (no shared experts) vs DeepSeek (shared experts)
         self.is_mixtral_style = (self.n_shared_experts == 0)
+        import os as _os
+        self.dna_moe_backend = _os.environ.get(
+            'DNANEMOTRON_VLLM_MOE_BACKEND', 'auto'
+        ).strip().lower()
+        if self.dna_moe_backend not in ('auto', 'ceno', 'fused', 'reference'):
+            raise ValueError(
+                'DNANEMOTRON_VLLM_MOE_BACKEND must be auto, ceno, fused or reference'
+            )
 
         router_dtype_name = str(getattr(config, 'moe_router_dtype', '') or '').lower()
         if router_dtype_name == 'fp32':
@@ -1042,9 +1075,40 @@ def patch_moe_class(source):
 
         top_k = getattr(config, 'num_experts_per_tok',
                          getattr(config, 'moe_top_k', 2))
+        self.top_k = int(top_k)
         intermediate_size = getattr(config, 'moe_intermediate_size',
                                      config.intermediate_size)
+        self.reference_intermediate_size = int(intermediate_size)
+        self.reference_hidden_size = int(self.moe_hidden_size)
         uses_swiglu = getattr(config, 'mlp_use_swiglu', False)
+        self.reference_activation = str(getattr(config, 'mlp_hidden_act', '')).lower()
+
+        if self.dna_moe_backend in ('reference', 'ceno'):
+            violations = []
+            if not self.is_mixtral_style:
+                violations.append('shared experts are unsupported')
+            if uses_swiglu:
+                violations.append('SwiGLU experts are unsupported')
+            if self.reference_activation not in ('relu2', 'squared_relu'):
+                violations.append('activation must be relu2/squared_relu')
+            if self.tp_size != 1 or self.ep_size != 1:
+                violations.append('TP and EP must both equal 1')
+            if self.enable_eplb or self.n_redundant_experts != 0:
+                violations.append('EPLB/redundant experts are unsupported')
+            if self.is_sequence_parallel:
+                violations.append('sequence parallelism is unsupported')
+            if quant_config is not None:
+                violations.append('quantization is unsupported')
+            if self.dna_moe_backend == 'ceno' and self.top_k != 2:
+                violations.append('CENO fused expert reduction requires top-k=2')
+            if self.dna_moe_backend == 'ceno' and getattr(config, 'moe_router_pre_softmax', False):
+                violations.append('CENO fused backend requires post-topk softmax')
+            if self.dna_moe_backend == 'ceno' and self.use_latent_moe:
+                violations.append('CENO fused backend does not support latent projections')
+            if violations:
+                raise ValueError(
+                    'DNANemotron reference MoE contract failed: ' + '; '.join(violations)
+                )
 
         if self.is_mixtral_style:
             self.experts = FusedMoE(
@@ -1087,6 +1151,17 @@ def patch_moe_class(source):
                 routed_input_transform=self.fc1_latent_proj,
             )
 
+        if self.dna_moe_backend == 'auto':
+            self.dna_moe_backend = 'ceno' if (
+                self.is_mixtral_style and not uses_swiglu and not self.use_latent_moe
+                and self.reference_activation in ('relu2', 'squared_relu')
+                and self.top_k == 2 and self.tp_size == self.ep_size == 1
+                and not self.is_sequence_parallel and not self.enable_eplb
+                and self.n_redundant_experts == 0 and quant_config is None
+                and not getattr(config, 'moe_router_pre_softmax', False)
+                and self.experts.w13_weight.dtype == torch.bfloat16
+            ) else 'fused'
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -1099,7 +1174,79 @@ def patch_moe_class(source):
             router_input = hidden_states.to(dtype=self.router_logits_dtype)
         router_logits, _ = self.gate(router_input)
 
-        if self.is_mixtral_style:
+        if self.is_mixtral_style and self.dna_moe_backend == 'ceno':
+            from vllm.model_executor.layers.ceno_moe import bf16_moe
+            final_hidden_states = bf16_moe(
+                hidden_states, self.experts.w13_weight, self.experts.w2_weight,
+                router_logits, self.top_k,
+            )
+        elif self.is_mixtral_style and self.dna_moe_backend == 'reference':
+            w13_weight = getattr(self.experts, 'w13_weight', None)
+            w2_weight = getattr(self.experts, 'w2_weight', None)
+            expected_w13 = (
+                self.n_routed_experts,
+                self.reference_intermediate_size,
+                self.reference_hidden_size,
+            )
+            expected_w2 = (
+                self.n_routed_experts,
+                self.reference_hidden_size,
+                self.reference_intermediate_size,
+            )
+            if w13_weight is None or tuple(w13_weight.shape) != expected_w13:
+                raise RuntimeError(
+                    f'unexpected reference w13 layout: '
+                    f'{None if w13_weight is None else tuple(w13_weight.shape)}; '
+                    f'expected {expected_w13}'
+                )
+            if w2_weight is None or tuple(w2_weight.shape) != expected_w2:
+                raise RuntimeError(
+                    f'unexpected reference w2 layout: '
+                    f'{None if w2_weight is None else tuple(w2_weight.shape)}; '
+                    f'expected {expected_w2}'
+                )
+            if (
+                w13_weight.dtype is not torch.bfloat16
+                or w2_weight.dtype is not torch.bfloat16
+                or not w13_weight.is_contiguous()
+                or not w2_weight.is_contiguous()
+            ):
+                raise RuntimeError(
+                    'reference expert weights must be contiguous BF16 tensors'
+                )
+
+            router_logits_float = router_logits.to(torch.float32)
+            topk_logits, selected_experts = torch.topk(
+                router_logits_float, self.top_k, dim=-1
+            )
+            routing_weights = torch.softmax(topk_logits, dim=-1)
+            expert_mask = torch.nn.functional.one_hot(
+                selected_experts, num_classes=self.n_routed_experts
+            ).permute(2, 1, 0)
+            final_hidden_states = torch.zeros_like(hidden_states)
+            # Match the checkpoint implementation exactly: BF16 up projection,
+            # squared ReLU, BF16 route scaling before down projection, then
+            # checkpoint-order index_add accumulation.
+            for expert_index in range(self.n_routed_experts):
+                route_slot, token_index = torch.where(expert_mask[expert_index])
+                if token_index.numel() == 0:
+                    continue
+                current = hidden_states[token_index]
+                intermediate = torch.nn.functional.linear(
+                    current, w13_weight[expert_index]
+                )
+                intermediate = torch.pow(torch.relu(intermediate), 2)
+                scale = routing_weights[token_index, route_slot].unsqueeze(-1).to(
+                    dtype=current.dtype
+                )
+                intermediate = intermediate * scale
+                expert_output = torch.nn.functional.linear(
+                    intermediate, w2_weight[expert_index]
+                )
+                final_hidden_states.index_add_(
+                    0, token_index, expert_output.to(dtype=hidden_states.dtype)
+                )
+        elif self.is_mixtral_style:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1299,22 +1446,41 @@ def patch_get_max_n_routed_experts(source):
 # Main
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 generation/patch_vllm_for_dna.py <checkpoint_dir>")
-        print("Example: python3 generation/patch_vllm_for_dna.py /path/to/ceno_checkpoint")
-        sys.exit(1)
-
-    model_dir = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model_dir", help="Disposable, independent runtime copy of the checkpoint")
+    parser.add_argument("--ssm-cache-dtype", choices=("float32", "bfloat16", "float16"),
+                        default="float32", help="FP32 is the long-decode default; lower precision is diagnostic")
+    parser.add_argument("--mamba-gate-mode", choices=("checkpoint", "training", "inference"),
+                        default="checkpoint",
+                        help="training: gate inside SSM, for confirmed Megatron memory-efficient "
+                             "training checkpoints; checkpoint: preserve stored contract")
+    parser.add_argument("--rmsnorm-mode", choices=("checkpoint", "torch", "te-general", "te-tuned"),
+                        default="checkpoint",
+                        help="Explicit vLLM RMSNorm arithmetic; TE modes require BF16 CENO width 512/1024. "
+                             "general: unaligned reference; tuned: aligned training kernel. "
+                             "This option alone does not establish whole-model parity.")
+    parser.add_argument("--reference-cp-size", choices=("checkpoint", "1", "8"),
+                        default="checkpoint", help="Explicit Megatron BF16 reference profile")
+    parser.add_argument("--reference-context-length", type=int,
+                        help="Fixed CP8 training/reference window; never inferred from a batch")
+    args = parser.parse_args()
+    model_dir = args.model_dir
 
     print("=" * 60)
-    print("DNA CENO vLLM Patcher v6")
+    print("CENO vLLM inference patcher (Megatron BF16 reference)")
     print("=" * 60)
     print(f"Checkpoint:  {model_dir}")
     print(f"Shared code: {SHARED_CODE_DIR}")
+    with open(__file__, "rb") as patch_file:
+        print(f"Patch SHA256: {hashlib.sha256(patch_file.read()).hexdigest()}")
     print()
 
+    validate_vllm_version()
     patch_shared_code()
-    prepare_checkpoint(model_dir)
+    prepare_checkpoint(model_dir, ssm_cache_dtype=args.ssm_cache_dtype,
+                       mamba_gate_mode=args.mamba_gate_mode, rmsnorm_mode=args.rmsnorm_mode,
+                       reference_cp_size=args.reference_cp_size,
+                       reference_context_length=args.reference_context_length)
     patch_vllm_source()
 
     print("\n" + "=" * 60)

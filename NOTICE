@@ -19,3 +19,7 @@ Nemotron-H is © NVIDIA Corporation. CENO and CENO-P are derivative works that
 build on the Nemotron-H Mamba/Attention/MoE hybrid backbone and add
 multi-species alignment (MSA) post-training. All NVIDIA copyright notices and
 license terms are preserved as required by the Apache License, Version 2.0.
+
+The CENO normalization and CP merge helpers include adaptations of NVIDIA
+TransformerEngine (Apache-2.0). Its license is included in the corresponding
+third_party/TransformerEngine-LICENSE file.
