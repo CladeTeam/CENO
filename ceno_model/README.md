@@ -1,4 +1,4 @@
-# ceno_model — CENO-P model code
+# ceno_model — CENO and CENO-P model code
 
 HuggingFace `trust_remote_code`-compatible package for **CENO-P**, the MSA
 (multi-species alignment) post-trained CENO model, built on the Nemotron-H
@@ -23,7 +23,7 @@ model = AutoModelForCausalLM.from_pretrained("<ckpt_dir>", trust_remote_code=Tru
 tok = AutoTokenizer.from_pretrained("<ckpt_dir>", trust_remote_code=True)
 ```
 The checkpoint's `config.json` carries `auto_map` pointing at the modules above;
-`generation/patch_vllm_for_dna.py` copies this package's files into the ckpt dir.
+For vLLM, `generation/patch_vllm_for_dna.py` prepares a separate disposable runtime.
 
 **B. As a Python package** (e.g. from the VEP adapter):
 ```python
@@ -43,7 +43,7 @@ These are read by the VEP adapter:
 Install CUDA-compatible builds for the active PyTorch environment with:
 
 ```bash
-pip install mamba-ssm causal-conv1d --no-build-isolation
+pip install mamba-ssm==2.2.4 causal-conv1d==1.2.2.post1 flash-attn==2.7.3 --no-build-isolation
 ```
 
 ## Smoke test (no weights needed)
@@ -51,3 +51,23 @@ pip install mamba-ssm causal-conv1d --no-build-isolation
 ```bash
 python -m ceno_model.examples.load_model
 ```
+
+## Inference maintenance
+
+Standalone base model repositories include `training_precision.py`, `ceno_norm.py`,
+`ceno_cp_math.py` and the upstream normalization license. Imports are relative to
+the model directory; HF does not require vLLM. Current base checkpoint metadata
+selects the corrected CUDA BF16 inference path. Use `torch_dtype="auto"` to retain
+the checkpoint dtype. The exact path is single-GPU, inference-only, unpadded,
+and limited to 131072 prefill tokens; larger prefills use the vLLM entry.
+
+CENO-P uses `modeling_ceno_p.py`, preserves `seq_idx` and MSA segment boundaries,
+and retains its own configured dtype. Base generation's bitwise reference claim
+must not be applied to CENO-P scoring. Model weights and token IDs are unchanged.
+
+The reference HF environment uses PyTorch 2.7.0a0 (NVIDIA 25.03), Transformers
+4.48.3, mamba-ssm 2.2.4, causal-conv1d 1.2.2.post1 and FlashAttention 2.7.3.
+The cluster tests use the existing environment; no installation is needed there.
+The public Dockerfile records the matching build recipe and was not rebuilt during
+this maintenance. Exact numerical evidence applies to the tested environment.
+Explicit `attn_implementation="eager"` is preserved for attention-map analysis.
