@@ -26,6 +26,10 @@ The patcher modifies the runtime and container-local vLLM, never source weights.
 Do not use hardlinked runtime copies. Keep all generation helpers beside the
 patcher. CENO-P is an HF MSA scorer, not a vLLM generation checkpoint.
 
+For a custom Python integration, follow the initialization in
+`vllm_offline_infer.py`, including `install_training_precision()` and its engine
+settings. A direct `LLM(...)` call after patching does not inherit the CLI setup.
+
 ## Numerical contract
 
 The corrected path uses FP32 Mamba state, training-order gating and MoE weighting,

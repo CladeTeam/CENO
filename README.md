@@ -38,14 +38,15 @@ open-source **code** for three tasks:
 
 | Part | Directory | What it does |
 |------|-----------|--------------|
-| 1. Model code | [`ceno_model/`](ceno_model) | HuggingFace `trust_remote_code` package for **CENO-P** (the MSA post-trained model). Loads via `from_pretrained`, supports both generation and MSA-based variant scoring. |
+| 1. Model code | [`ceno_model/`](ceno_model) | HuggingFace `trust_remote_code` package for base **CENO** generation and **CENO-P** MSA-based variant scoring, loaded via `from_pretrained`. |
 | 2. Variant Effect Prediction (VEP) | [`vep/`](vep) | HuggingFace-only VEP pipeline with a **TraitGym** worked example: load CENO-P → score WT vs. variant sequences (delta log-likelihood) → AUROC / AUPRC. |
 | 3. Generation demo | [`generation/`](generation) | vLLM offline inference demo (generation + embedding) for the pre-trained DNA model, including the patcher that wires this repo's model code into a checkpoint dir. |
 
 > [!NOTE]
 > **This repo ships code only.** Model weights live on the HuggingFace Hub — see
-> [Checkpoints](#-checkpoints) below. The code is checkpoint-agnostic: point the VEP and
-> generation entry points at a checkpoint — either a Hub id or a local directory.
+> [Checkpoints](#-checkpoints) below. HF/VEP loading accepts a Hub id or a local
+> directory. vLLM generation uses a downloaded checkpoint prepared as a separate
+> runtime directory; see [generation](generation/README.md).
 
 ## At a glance
 
@@ -100,7 +101,7 @@ and [`vep/README.md`](vep/README.md) for the corresponding commands and required
 
 ## Architecture in one paragraph
 
-CENO packs a 2-D multiple-sequence alignment `(L, D)` (length × depth) into a single 1-D token
+**CENO-P** packs a 2-D multiple-sequence alignment `(L, D)` (length × depth) into a single 1-D token
 sequence by **concatenating the MSA rows** `[row₁, row₂, …, row_K, target]` with no special
 tokens, and passes a per-token `seq_idx` so the model knows the row boundaries. A per-layer
 `intra_encoding_pattern` (`+` = isolate rows by resetting Mamba SSM state and masking
