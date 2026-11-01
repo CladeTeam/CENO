@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""
-Patch vLLM for DNA NemotronH inference.
+"""Prepare a disposable CENO runtime and patch the container's vLLM 0.15.1.
 
-This script does three things:
-  1. Patches shared model code (evo2_tokenizer, tokenizer_config) — once
-  2. Prepares a checkpoint directory (symlinks shared files, ensures auto_map)
-  3. Patches vLLM source code in the container
-
-Current attention behavior:
-  - Keep vLLM's native contiguous q/k/v split for correctly reconverted HF
-    checkpoints.
-  - Do NOT reintroduce the older interleaved attention forward patch, which
-    only compensated for legacy HF exports with incorrectly split q/k/v.
+Copy the source checkpoint into an independent runtime directory first. This
+script installs model/tokenizer files and metadata in that runtime, then patches
+the container-local vLLM modules. It preserves the native contiguous Q/K/V split.
+Do not pass a source checkpoint directory or a hardlinked runtime.
 
 Usage:
-    python3 generation/patch_vllm_for_dna.py <checkpoint_dir>
+    python3 generation/patch_vllm_for_dna.py /path/to/disposable-runtime
 
-Example:
-    python3 generation/patch_vllm_for_dna.py \
-        /mnt/shared-storage-user/dnacoding/nemotron_models_v2/hf/ablation/300M_A100M_stage2_v1_c2
+See the README in this directory for the complete copy/patch/inference sequence.
 """
 
 import argparse
