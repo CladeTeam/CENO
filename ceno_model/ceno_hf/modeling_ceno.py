@@ -17,6 +17,7 @@
 """PyTorch CENO model."""
 
 import contextlib
+import functools
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
@@ -75,6 +76,39 @@ def _precision_module():
     import importlib
     name = f"{__package__}.training_precision" if __package__ else "training_precision"
     return importlib.import_module(name)
+
+
+def _mark_backend_scope(model):
+    """Run this model's forward (and its backbone's) under the reference GEMM flags."""
+    for module in model.modules():
+        if isinstance(module, (CENOModel, CENOForCausalLM)):
+            module._ceno_backend_scope = True
+
+
+def _wants_lazy_precision(model, kwargs):
+    # Mirrors the lazy enable condition in CENOForCausalLM.forward.
+    config = model.config
+    return (getattr(config, "ceno_training_precision", False)
+            and not model.training and not torch.is_grad_enabled()
+            and not (kwargs.get("output_attentions") or config.output_attentions)
+            and not getattr(model, "_ceno_preserve_attention_backend", False)
+            and model.device.type == "cuda" and model.dtype == torch.bfloat16)
+
+
+def _with_backend_scope(forward):
+    """Scope backend flags to the forward instead of changing them process-wide."""
+    @functools.wraps(forward)
+    def wrapper(self, *args, **kwargs):
+        if (not getattr(self, "_ceno_backend_scope", False)
+                and isinstance(self, CENOForCausalLM)
+                and _wants_lazy_precision(self, kwargs)):
+            _precision_module().configure_backend()
+            _mark_backend_scope(self)
+        if getattr(self, "_ceno_backend_scope", False):
+            with _precision_module().backend_scope():
+                return forward(self, *args, **kwargs)
+        return forward(self, *args, **kwargs)
+    return wrapper
 
 logger = logging.get_logger(__name__)
 
@@ -1640,6 +1674,7 @@ class CENOModel(CENOPreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.embeddings = new_embeddings
 
+    @_with_backend_scope
     @add_start_docstrings_to_model_forward(CENO_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
@@ -1871,7 +1906,10 @@ class CENOForCausalLM(CENOPreTrainedModel, GenerationMixin):
         model = result[0] if isinstance(result, tuple) else result
         model._ceno_preserve_attention_backend = preserve
         if getattr(model.config, "ceno_training_precision", False) and not preserve:
+            # Only the cuBLAS workspace env is process-level; torch GEMM flags
+            # are applied inside this model's forward (see _with_backend_scope).
             _precision_module().configure_backend()
+            _mark_backend_scope(model)
         return result
 
     def __init__(self, config):
@@ -1965,6 +2003,7 @@ class CENOForCausalLM(CENOPreTrainedModel, GenerationMixin):
         )
         return model_inputs
 
+    @_with_backend_scope
     @add_start_docstrings_to_model_forward(CENO_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
