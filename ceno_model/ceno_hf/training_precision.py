@@ -20,16 +20,18 @@ def _local_module(name):
 
 
 def configure_backend():
-    """Set the cuBLAS workspace environment; call before the first CUDA GEMM.
+    """Set the cuBLASLt workspace limit; call before the first CUDA GEMM.
 
-    These two variables are read once when cuBLAS handles are created, so they
-    stay process-level. The torch backend flags used by the reference
-    arithmetic are no longer changed globally: precision-enabled CENO modules
-    enter ``backend_scope()`` for the duration of their forward only, so the
-    surrounding program (e.g. an FP32 head trained with TF32) keeps its own
-    settings.
+    The reference GEMMs run through cuBLASLt (see ``backend_scope``) with a
+    1 KiB workspace, which is what fixes their algorithm and hence their bits.
+    That is the only process-level setting. ``CUBLAS_WORKSPACE_CONFIG`` is not
+    set: it only sizes the legacy cuBLAS handle workspace, which these GEMMs do
+    not use (outputs are bit-identical with or without it), and under torch 2.7
+    it adds ~30-40 us of host time to every GEMM call, the main cost of B=1
+    decode. The torch backend flags are applied only inside precision-enabled
+    forwards, so the surrounding program (e.g. an FP32 head trained with TF32)
+    keeps its own settings.
     """
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
     os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
 
 
@@ -177,6 +179,7 @@ def _install_scan_hooks(module):
             return update(state_tensor, x, dt, A, B, C, D, *args, **kwargs)
         mixer, cache = active
         state = _cache_buffers(cache)[mixer.layer_idx]
+        state["decoded"] = True  # decode kernels have run eagerly once (graph warm-up)
         pos = state["pos"]
         # The recurrent update's output was never used and state_tensor is only
         # read back at the chunk boundary below, so it is not run per token.
@@ -206,7 +209,243 @@ def _install_scan_hooks(module):
     module.mamba_chunk_scan_combined = scan_with_cache
     module.selective_state_update = update_from_chunk
     module._ceno_scan_context = context
+    module._ceno_scan_parts = parts if fast else None
     return context
+
+
+class _DecodeGraph:
+    """Batch-1 cached decode replayed as CUDA graphs, one per span between attention layers.
+
+    Every kernel is the one the eager decode step launches, with the same shapes and
+    inputs, so replay is bit-identical; only the host work is removed. Three eager
+    pieces remain: the attention mixers (growing KV cache), the chunk-boundary step
+    (full scan, handled by the caller falling back to eager) and the chunk-buffer
+    reset at chunk position 0. Two data-dependent host decisions are moved onto the
+    device: the chunk position (an index tensor) and the MoE expert loop (every
+    expert runs on the single token; a non-selected expert's result is discarded by
+    torch.where, a selected one goes through the same index_add_ as eagerly).
+    """
+
+    _KEYS = ("x", "dt", "B", "C", "z")
+
+    def __init__(self, model, modeling, cache):
+        import torch
+        self.model, self.modeling, self.cache = model, modeling, cache
+        self.parts = modeling._ceno_scan_parts
+        self.layers = model.backbone.layers
+        self.chunks = cache._ceno_chunks
+        self.mamba = [i for i, b in enumerate(self.layers) if b.block_type == "mamba"]
+        self.attention = [i for i, b in enumerate(self.layers) if b.block_type == "attention"]
+        self.inference = torch.is_inference_mode_enabled()
+        self.key = self._key()
+        device = model.device
+        self.ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+        self.pos = torch.zeros((1,), device=device, dtype=torch.long)
+        self.row0 = torch.zeros((1,), device=device, dtype=torch.long)
+        hidden = model.config.hidden_size
+        self.attn_out = [torch.zeros((1, 1, hidden), device=device, dtype=model.dtype)
+                         for _ in self.attention]
+        self.attn_in, self.attn_res, self.graphs = [None] * len(self.attention), [None] * len(self.attention), []
+        self.logits = None
+        self._capture()
+
+    def _key(self):
+        import torch
+        ptrs = [self.cache.conv_states[i].data_ptr() for i in self.mamba]
+        for i in self.mamba:
+            state = self.chunks[i]
+            ptrs += [state[k].data_ptr() for k in self._KEYS + ("initial", "A")]
+        return (torch.is_inference_mode_enabled(), tuple(ptrs))
+
+    def valid(self, cache):
+        return cache is self.cache and self._key() == self.key
+
+    # ----- graph bodies: same module calls / kernels as the eager decode path -----
+    def _mamba(self, i, hidden_states):
+        import torch
+        mixer, cache, state = self.layers[i].mixer, self.cache, self.chunks[i]
+        hidden_states = mixer._maybe_apply_in_proj_norm(hidden_states)
+        projected_states = mixer.in_proj(hidden_states)
+        batch_size = hidden_states.shape[0]
+        groups_time_state_size = mixer.n_groups * mixer.ssm_state_size
+        d_mlp = (projected_states.shape[-1] - 2 * mixer.intermediate_size
+                 - 2 * groups_time_state_size - mixer.num_heads) // 2
+        _, _, gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
+            [d_mlp, d_mlp, mixer.intermediate_size, mixer.conv_dim, mixer.num_heads], dim=-1)
+        hidden_states_B_C = self.modeling.causal_conv1d_update(
+            hidden_states_B_C, cache.conv_states[i], mixer.conv1d.weight.squeeze(1),
+            mixer.conv1d.bias, mixer.activation)
+        x, B, C = torch.split(hidden_states_B_C,
+                              [mixer.intermediate_size, groups_time_state_size, groups_time_state_size], dim=-1)
+        values = (x.view(batch_size, mixer.num_heads, mixer.head_dim), dt,
+                  B.view(batch_size, mixer.n_groups, -1), C.view(batch_size, mixer.n_groups, -1),
+                  gate.view(batch_size, mixer.num_heads, mixer.head_dim))
+        for key, value in zip(self._KEYS, values):
+            state[key].index_copy_(1, self.pos, value.unsqueeze(1))
+        parts = self.parts
+        initial = state["initial"]
+        batch, heads, dim, dstate = initial.shape
+        flat = initial.reshape(batch, heads, dim * dstate)
+        states_in, _ = parts._state_passing_fwd(
+            torch.zeros((batch, 1, heads, dim * dstate), device=flat.device, dtype=torch.float32),
+            torch.zeros((batch, heads, 1), device=flat.device, dtype=torch.float32),
+            initial_states=flat, chunk_size=_CHUNK, out_dtype=state["C"].dtype)
+        states_in = states_in.view(batch, 1, heads, dim, dstate)
+        dA_cumsum, dt = parts._chunk_cumsum_fwd(
+            state["dt"], state["A"], _CHUNK, dt_bias=mixer.dt_bias, dt_softplus=True,
+            dt_limit=mixer.time_step_limit)
+        CB = parts._bmm_chunk_fwd(state["C"], state["B"], _CHUNK, seq_idx=None, output_dtype=torch.float32)
+        D = mixer.D if mixer.D.stride(-1) == 1 else mixer.D.contiguous()
+        out, _ = parts._chunk_scan_fwd(CB, state["x"], dt, dA_cumsum, state["C"], states_in,
+                                       D=D, z=state["z"], seq_idx=None)
+        y = out.index_select(1, self.pos).view(batch_size, mixer.num_heads * mixer.head_dim)
+        y = mixer.norm(y, None)
+        return mixer.out_proj(y)[:, None, ...]
+
+    def _moe(self, moe, hidden_states):
+        import torch
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        router_softmax = getattr(moe, "_ceno_router_softmax", torch.nn.functional.softmax)
+        flat = hidden_states.view(-1, hidden_dim)
+        if str(getattr(moe.config, "moe_router_dtype", "")).lower() == "fp32":
+            router_logits = torch.nn.functional.linear(flat.to(torch.float32), moe.gate.weight.to(torch.float32), bias=None)
+        else:
+            router_logits = moe.gate(flat).to(torch.float32)
+        topk_logits, selected = torch.topk(router_logits, moe.top_k, dim=-1)
+        weights = router_softmax(topk_logits, dim=-1)
+        final = torch.zeros_like(flat)
+        for expert_idx in range(moe.num_experts):
+            hit = selected[0] == expert_idx                       # (top_k,)
+            weight = torch.where(hit, weights[0], 0.).sum().view(1, 1).to(flat.dtype)
+            out = moe.experts[expert_idx](flat, per_token_scale=weight)
+            added = final.index_add(0, self.row0, out.to(hidden_states.dtype))
+            final = torch.where(hit.any(), added, final)
+        return final.view(batch_size, seq_len, hidden_dim)
+
+    def _span(self, start, end, hidden_states):
+        for i in range(start, end):
+            block = self.layers[i]
+            if block.block_type == "mamba":
+                residual = hidden_states
+                if block.norm is not None:
+                    hidden_states = block.norm(hidden_states.to(dtype=block.norm.weight.dtype))
+                if block.residual_in_fp32:
+                    residual = residual.to(self._fp32)
+                hidden_states = residual + self._mamba(i, hidden_states)
+            elif block.block_type in ("moe", "mlp"):
+                input_ln_out = block.norm(hidden_states.to(dtype=block.norm.weight.dtype))
+                residual = input_ln_out
+                if block.residual_in_fp32:
+                    residual = residual.to(self._fp32)
+                pre = block.pre_mlp_norm(input_ln_out.to(dtype=block.pre_mlp_norm.weight.dtype))
+                out = self._moe(block.mixer, pre) if block.block_type == "moe" else block.mixer(pre)
+                hidden_states = residual + out
+            else:
+                raise RuntimeError("attention layers are span boundaries")
+        return hidden_states
+
+    def _segment(self, k):
+        """Span k: after attention k-1 (or the embedding) up to attention k's input norm."""
+        bounds = [-1] + self.attention + [len(self.layers)]
+        start, end = bounds[k] + 1, bounds[k + 1]
+        if k == 0:
+            hidden_states = self.model.backbone.embeddings(self.ids)
+        else:
+            block = self.layers[bounds[k]]
+            hidden_states = self.attn_res[k - 1] + self.attn_out[k - 1]
+            hidden_states = block.pre_mlp_norm(hidden_states.to(dtype=block.pre_mlp_norm.weight.dtype))
+        hidden_states = self._span(start, end, hidden_states)
+        if k < len(self.attention):
+            block = self.layers[end]
+            residual = hidden_states
+            self.attn_in[k] = block.norm(hidden_states.to(dtype=block.norm.weight.dtype))
+            self.attn_res[k] = residual.to(self._fp32) if block.residual_in_fp32 else residual
+        else:
+            hidden_states = self.model.backbone.norm_f(hidden_states)
+            lm_head = self.model.lm_head
+            self.logits = lm_head(hidden_states.to(lm_head.weight.dtype)).float()
+
+    def _capture(self):
+        import torch
+        self._fp32 = torch.float32
+        segments = len(self.attention) + 1
+        # The warm-up really runs the bodies: it shifts the conv states and writes the
+        # chunk buffers. Snapshot everything it can write and restore it afterwards.
+        mutable = [self.cache.conv_states[i] for i in self.mamba]
+        mutable += [self.chunks[i][key] for i in self.mamba for key in self._KEYS]
+        snapshot = [t.clone() for t in mutable]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for k in range(segments):
+                self._segment(k)
+        torch.cuda.current_stream().wait_stream(stream)
+        for tensor, saved in zip(mutable, snapshot):
+            tensor.copy_(saved)
+        del snapshot
+        pool = torch.cuda.graph_pool_handle()
+        for k in range(segments):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                self._segment(k)
+            self.graphs.append(graph)
+        torch.cuda.synchronize()
+
+    def step(self, input_ids, pos):
+        if pos == 0:
+            for i in self.mamba:
+                for key in self._KEYS:
+                    self.chunks[i][key].zero_()
+        self.ids.copy_(input_ids)
+        self.pos.fill_(pos)
+        for k, graph in enumerate(self.graphs):
+            graph.replay()
+            if k < len(self.attention):
+                mixer = self.layers[self.attention[k]].mixer
+                out = mixer(self.attn_in[k], attention_mask=None, past_key_value=self.cache,
+                            use_cache=True, cache_position=None)[0]
+                self.attn_out[k].copy_(out)
+        for i in self.mamba:
+            self.chunks[i]["pos"] = pos + 1
+        return self.logits.clone()
+
+
+def _decode_graph_step(model, modeling, kwargs):
+    """Return logits from the graph path, or None to run the eager forward."""
+    if os.environ.get("CENO_HF_DECODE_GRAPH", "1") == "0" or getattr(modeling, "_ceno_scan_parts", None) is None:
+        return None
+    if any(kwargs.get(k) is not None for k in ("inputs_embeds", "labels", "seq_idx")) or any(
+            kwargs.get(k) for k in ("output_attentions", "output_hidden_states")):
+        return None
+    if kwargs.get("use_cache") is False or (kwargs.get("use_cache") is None and not model.config.use_cache):
+        return None
+    ids = kwargs.get("input_ids")
+    cache = kwargs.get("cache_params") or kwargs.get("past_key_values")
+    position = kwargs.get("cache_position")
+    if (ids is None or tuple(ids.shape) != (1, 1) or cache is None or position is None
+            or position.numel() != 1 or model.config.output_hidden_states or model.config.output_attentions):
+        return None
+    chunks = getattr(cache, "_ceno_chunks", None)
+    layers = model.backbone.layers
+    mamba = [i for i, b in enumerate(layers) if b.block_type == "mamba"]
+    if not mamba or not chunks or any(i not in chunks or not chunks[i].get("decoded") for i in mamba):
+        return None
+    positions = {chunks[i]["pos"] for i in mamba}
+    if len(positions) != 1 or any(len(cache.key_cache[i].shape) != 4 for i in cache.attention_layers):
+        return None
+    pos = positions.pop()
+    if pos == _CHUNK - 1:
+        return None  # chunk boundary: full scan in the eager path
+    runner = getattr(cache, "_ceno_decode_graph", None)
+    with backend_scope():
+        if runner is None or not runner.valid(cache):
+            runner = cache._ceno_decode_graph = None
+            if pos == 0:  # the eager reset happens in step(); capture after it
+                for i in mamba:
+                    for key in _DecodeGraph._KEYS:
+                        chunks[i][key].zero_()
+            runner = cache._ceno_decode_graph = _DecodeGraph(model, modeling, cache)
+        return runner.step(ids, pos)
 
 
 def _attention(q, k, v, causal):
@@ -381,6 +620,15 @@ def enable_training_precision(model, *, norm_mode=None, reference_cp_size=None,
         mask = kwargs.get("attention_mask")
         if mask is not None and not bool(torch.all(mask)):
             raise ValueError("HF precision currently requires unpadded uniform-length batches")
+        if len(args) <= 1 and not (args and "input_ids" in kwargs):
+            graph_kwargs = dict(kwargs, input_ids=args[0]) if args else kwargs
+            logits = _decode_graph_step(model, modeling, graph_kwargs)
+            if logits is not None:
+                cache = kwargs.get("cache_params") or kwargs.get("past_key_values")
+                if kwargs.get("return_dict", model.config.use_return_dict) is False:
+                    return (logits, cache)
+                return modeling.CENOCausalLMOutput(logits=logits, cache_params=cache,
+                                                        past_key_values=cache)
         return original_forward(*args, **kwargs)
 
     model.forward = checked_forward
