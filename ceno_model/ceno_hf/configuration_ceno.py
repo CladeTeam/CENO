@@ -86,11 +86,11 @@ class CENOConfig(PretrainedConfig):
         num_logits_to_keep (`int` or `None`, *optional*, defaults to 1):
             Number of prompt logits to calculate during generation. If `None`, all logits will be calculated. If an
             integer value, only last `num_logits_to_keep` logits will be calculated.
-        pad_token_id (`int`, *optional*, defaults to 0):
+        pad_token_id (`int`, *optional*, defaults to 1):
             The id of the padding token.
-        bos_token_id (`int`, *optional*, defaults to 1):
+        bos_token_id (`int`, *optional*, defaults to 0):
             The id of the "beginning-of-sequence" token.
-        eos_token_id (`int`, *optional*, defaults to 2):
+        eos_token_id (`int`, *optional*, defaults to 0):
             The id of the "end-of-sequence" token.
         sliding_window (`int`, *optional*, defaults to None):
             Sliding window attention window size.

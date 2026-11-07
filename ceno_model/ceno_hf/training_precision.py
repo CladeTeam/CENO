@@ -5,6 +5,7 @@ Defaults in exported checkpoints are unchanged. This adapter is inference-only,
 single-GPU, BF16, unpadded uniform-length batches. Its prefill token budget is
 bounded to avoid the old Mamba kernels' large-stride indexing paths.
 """
+import contextlib
 import contextvars
 import functools
 import os
@@ -19,16 +20,43 @@ def _local_module(name):
 
 
 def configure_backend():
-    """Call before CUDA matrix multiplication; settings apply to this process."""
+    """Set the cuBLAS workspace environment; call before the first CUDA GEMM.
+
+    These two variables are read once when cuBLAS handles are created, so they
+    stay process-level. The torch backend flags used by the reference
+    arithmetic are no longer changed globally: precision-enabled CENO modules
+    enter ``backend_scope()`` for the duration of their forward only, so the
+    surrounding program (e.g. an FP32 head trained with TF32) keeps its own
+    settings.
+    """
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
     os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+
+
+@contextlib.contextmanager
+def backend_scope():
+    """Apply the reference GEMM flags inside the block and restore them on exit."""
     import torch
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    if torch.version.cuda is not None:
+    matmul, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    has_cuda = torch.version.cuda is not None
+    saved = (matmul.allow_bf16_reduced_precision_reduction,
+             matmul.allow_fp16_reduced_precision_reduction,
+             matmul.allow_tf32, cudnn.allow_tf32,
+             torch.backends.cuda.preferred_blas_library() if has_cuda else None)
+    matmul.allow_bf16_reduced_precision_reduction = False
+    matmul.allow_fp16_reduced_precision_reduction = False
+    matmul.allow_tf32 = False
+    cudnn.allow_tf32 = False
+    if has_cuda:
         torch.backends.cuda.preferred_blas_library("cublaslt")
+    try:
+        yield
+    finally:
+        (matmul.allow_bf16_reduced_precision_reduction,
+         matmul.allow_fp16_reduced_precision_reduction,
+         matmul.allow_tf32, cudnn.allow_tf32) = saved[:4]
+        if has_cuda:
+            torch.backends.cuda.preferred_blas_library(saved[4])
 
 
 def _pin_scan():
@@ -64,6 +92,7 @@ def _cache_buffers(cache):
                 for key in ("initial", "x", "dt", "B", "C", "z"):
                     value = state[key]
                     state[key] = value.index_select(0, beam_idx.to(value.device))
+                state["states_in"] = None  # derived from "initial"; rebuild lazily
             return result
 
         cache.reorder_cache = reorder
@@ -72,6 +101,7 @@ def _cache_buffers(cache):
 
 def _install_scan_hooks(module):
     """Namespace hooks are inactive unless a precision-enabled mixer sets context."""
+    import importlib
     import torch
     if hasattr(module, "_ceno_scan_context"):
         return module._ceno_scan_context
@@ -100,7 +130,7 @@ def _install_scan_hooks(module):
                            *args, **prefix_kwargs)[1]
         else:
             initial = torch.zeros_like(result[1])
-        state = {"initial": initial, "pos": count}
+        state = {"initial": initial, "pos": count, "states_in": None}
         values = {"x": x, "dt": dt, "B": B, "C": C, "z": z}
         for key, value in values.items():
             buffer = torch.zeros((batch, _CHUNK, *value.shape[2:]),
@@ -111,6 +141,36 @@ def _install_scan_hooks(module):
         _cache_buffers(cache)[mixer.layer_idx] = state
         return result
 
+    # The combined scan's own building blocks. Off the chunk boundary only the
+    # output row is needed, so chunk_state/state_passing (which only produce the
+    # final state) are skipped; the remaining calls receive exactly the inputs the
+    # combined forward would pass them, so the row is bit-identical.
+    parts = importlib.import_module(scan.__module__)
+    fast = all(hasattr(parts, name) for name in
+               ("_chunk_cumsum_fwd", "_bmm_chunk_fwd", "_chunk_scan_fwd", "_state_passing_fwd"))
+
+    def chunk_row(mixer, state, pos):
+        if state.get("states_in") is None:
+            # Entering-chunk state exactly as _state_passing_fwd emits it for chunk 0
+            # (FP32 initial stored in C's dtype).
+            initial = state["initial"]
+            batch, heads, dim, dstate = initial.shape
+            flat = initial.reshape(batch, heads, dim * dstate)
+            out, _ = parts._state_passing_fwd(
+                torch.zeros((batch, 1, heads, dim * dstate), device=flat.device, dtype=torch.float32),
+                torch.zeros((batch, heads, 1), device=flat.device, dtype=torch.float32),
+                initial_states=flat, chunk_size=_CHUNK, out_dtype=state["C"].dtype)
+            state["states_in"] = out.view(batch, 1, heads, dim, dstate)
+        dA_cumsum, dt = parts._chunk_cumsum_fwd(
+            state["dt"], state["A"], _CHUNK, dt_bias=mixer.dt_bias, dt_softplus=True,
+            dt_limit=mixer.time_step_limit)
+        CB = parts._bmm_chunk_fwd(state["C"], state["B"], _CHUNK, seq_idx=None,
+                                  output_dtype=torch.float32)
+        D = mixer.D if mixer.D.stride(-1) == 1 else mixer.D.contiguous()
+        out, _ = parts._chunk_scan_fwd(CB, state["x"], dt, dA_cumsum, state["C"],
+                                       state["states_in"], D=D, z=state["z"], seq_idx=None)
+        return out[:, pos]
+
     def update_from_chunk(state_tensor, x, dt, A, B, C, D, *args, **kwargs):
         active = context.get()
         if active is None:
@@ -118,22 +178,30 @@ def _install_scan_hooks(module):
         mixer, cache = active
         state = _cache_buffers(cache)[mixer.layer_idx]
         pos = state["pos"]
-        update(state_tensor, x, dt, A, B, C, D, *args, **kwargs)
+        # The recurrent update's output was never used and state_tensor is only
+        # read back at the chunk boundary below, so it is not run per token.
         for key, value in (("x", x), ("dt", dt[:, :, 0]), ("B", B), ("C", C),
                            ("z", kwargs["z"])):
             if pos == 0:
                 state[key].zero_()
             state[key][:, pos].copy_(value)
-        y, final = scan(state["x"], state["dt"], -torch.exp(mixer.A_log.float()),
-                        state["B"], state["C"], chunk_size=_CHUNK, D=mixer.D,
-                        z=state["z"], dt_bias=mixer.dt_bias, dt_softplus=True,
-                        dt_limit=mixer.time_step_limit, initial_states=state["initial"],
-                        return_final_states=True)
+        if "A" not in state:
+            state["A"] = -torch.exp(mixer.A_log.float())
+        if pos == _CHUNK - 1 or not fast:
+            y, final = scan(state["x"], state["dt"], state["A"],
+                            state["B"], state["C"], chunk_size=_CHUNK, D=mixer.D,
+                            z=state["z"], dt_bias=mixer.dt_bias, dt_softplus=True,
+                            dt_limit=mixer.time_step_limit, initial_states=state["initial"],
+                            return_final_states=True)
+            y = y[:, pos]
+        else:
+            y = chunk_row(mixer, state, pos)
         if pos == _CHUNK - 1:
             state["initial"].copy_(final)
             state_tensor.copy_(final)
+            state["states_in"] = None
         state["pos"] = (pos + 1) % _CHUNK
-        return y[:, pos]
+        return y
 
     module.mamba_chunk_scan_combined = scan_with_cache
     module.selective_state_update = update_from_chunk
@@ -146,8 +214,10 @@ def _attention(q, k, v, causal):
     import torch
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    cuq = torch.tensor([0, len(q)], device=q.device, dtype=torch.int32)
-    cuk = torch.tensor([0, len(k)], device=q.device, dtype=torch.int32)
+    # Build [0, n] on the device: torch.tensor(..., device=cuda) copies from
+    # pageable host memory and synchronizes the stream on every call.
+    steps = torch.arange(2, device=q.device, dtype=torch.int32)
+    cuq, cuk = steps * len(q), steps * len(k)
     result = _flash_attn_varlen_forward(
         q, k, v, cuq, cuk, len(q), len(k), dropout_p=0., softmax_scale=q.shape[-1] ** -.5,
         causal=causal, window_size_left=-1, window_size_right=0 if causal else -1,
@@ -205,7 +275,8 @@ def enable_training_precision(model, *, norm_mode=None, reference_cp_size=None,
     configure_backend()
     import sys
     import torch
-    te_rms_norm = _local_module("ceno_norm").te_rms_norm
+    norm_module = _local_module("ceno_norm")
+    te_rms_norm, te_rms_norm_eager = norm_module.te_rms_norm, norm_module._te_rms_norm_impl
 
     config = model.config
     modeling = sys.modules[type(model).__module__]
@@ -239,6 +310,10 @@ def enable_training_precision(model, *, norm_mode=None, reference_cp_size=None,
         raise ValueError("HF precision requires single-GPU BF16 and the CUDA Mamba/FA2 environment")
     if any(p.device != model.device for p in model.parameters()):
         raise ValueError("HF training precision requires one CUDA device")
+    mark = getattr(modeling, "_mark_backend_scope", None)
+    if mark is None:
+        raise ValueError("HF precision requires a modeling file with scoped backend flags")
+    mark(model)
     config.ceno_mamba_gate_in_ssm = True
     config.ceno_rmsnorm_mode = norm_mode
     config.ceno_reference_cp_size = reference_cp_size
@@ -246,7 +321,9 @@ def enable_training_precision(model, *, norm_mode=None, reference_cp_size=None,
     _pin_scan()
     context = _install_scan_hooks(modeling)
     def norm(self, x):
-        return te_rms_norm(x, self.weight, self.variance_epsilon, norm_mode)
+        # Same Triton kernel; the registered op is only needed under torch.compile.
+        op = te_rms_norm if torch.compiler.is_compiling() else te_rms_norm_eager
+        return op(x, self.weight, self.variance_epsilon, norm_mode)
 
     def softmax(x, dim=-1):
         exp = torch.exp(x - torch.amax(x, dim=dim, keepdim=True))
