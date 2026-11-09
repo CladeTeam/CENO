@@ -121,7 +121,7 @@ applicable code fixes, with their own model and post-training behavior preserved
 
 - **CENO** — base DNA foundation model (bfloat16), for **generation** / single-sequence scoring.
   Four sizes (80M / 300M / 600M / 1B) × three training-context stages (`base` / `131k` / `1m`)
-  = 12 checkpoints, e.g. [`CladeTeam/CENO-1B-base`](https://huggingface.co/CladeTeam/CENO-1B-base).
+  = 12 checkpoints, e.g. [`CladeTeam/CENO-1.3B-A450M-base`](https://huggingface.co/CladeTeam/CENO-1.3B-A450M-base).
 - **CENO-P** — MSA post-trained (float32), for **variant-effect scoring** (see [`vep/`](vep)).
   Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-600M`](https://huggingface.co/CladeTeam/CENO-P-600M).
 
@@ -141,7 +141,7 @@ smoke tests. Multi-GPU placement is outside the corrected precision contract.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "CladeTeam/CENO-1B-base"            # any *base* CENO checkpoint
+model_id = "CladeTeam/CENO-1.3B-A450M-base"    # any *base* CENO checkpoint
 tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
