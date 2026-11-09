@@ -41,6 +41,7 @@ open-source **code** for three tasks:
 | 1. Model code | [`ceno_model/`](ceno_model) | HuggingFace `trust_remote_code` package for base **CENO** generation and **CENO-P** MSA-based variant scoring, loaded via `from_pretrained`. |
 | 2. Variant Effect Prediction (VEP) | [`vep/`](vep) | HuggingFace-only VEP pipeline with a **TraitGym** worked example: load CENO-P → score WT vs. variant sequences (delta log-likelihood) → AUROC / AUPRC. |
 | 3. Generation demo | [`generation/`](generation) | vLLM offline inference demo (generation + embedding) for the pre-trained DNA model, including the patcher that wires this repo's model code into a checkpoint dir. |
+| 4. Fine-tuning | [`finetune/`](finetune) | Generic continued pretraining / SFT on your own DNA sequences (FASTA, text or JSONL) with the Hugging Face `Trainer`; full or LoRA, single or multi-GPU. |
 
 > [!NOTE]
 > **This repo ships code only.** Model weights live on the HuggingFace Hub — see
