@@ -115,13 +115,17 @@ scoring. See [`ceno_model/README.md`](ceno_model/README.md) for the `from_pretra
 
 Model weights are published on the HuggingFace Hub under the [`CladeTeam`](https://huggingface.co/CladeTeam)
 organization — see the [CENO collection](https://huggingface.co/collections/CladeTeam/ceno).
-The main collection has **15 checkpoints** in two families. The organization also
-hosts three legacy preview/CDS checkpoints; all 18 CENO repositories receive the
+The main collection has **18 checkpoints** in two families. The organization also
+hosts three legacy preview/CDS checkpoints; all 21 CENO repositories receive the
 applicable code fixes, with their own model and post-training behavior preserved:
 
 - **CENO** — base DNA foundation model (bfloat16), for **generation** / single-sequence scoring.
-  Four sizes (80M / 300M / 600M / 1B) × three training-context stages (`base` / `131k` / `1m`)
-  = 12 checkpoints, e.g. [`CladeTeam/CENO-1.3B-A450M-base`](https://huggingface.co/CladeTeam/CENO-1.3B-A450M-base).
+  Five sizes (80M / 300M / 600M / 1.3B / 9B) × three training-context stages (`base` / `131k` / `1m`)
+  = 15 checkpoints, e.g. [`CladeTeam/CENO-1.3B-A450M-base`](https://huggingface.co/CladeTeam/CENO-1.3B-A450M-base).
+  The largest size, **9B** (A3B active), is published as
+  [`CladeTeam/CENO-9B-A3B-base`](https://huggingface.co/CladeTeam/CENO-9B-A3B-base),
+  [`CladeTeam/CENO-9B-A3B-131k`](https://huggingface.co/CladeTeam/CENO-9B-A3B-131k) and
+  [`CladeTeam/CENO-9B-A3B-1m`](https://huggingface.co/CladeTeam/CENO-9B-A3B-1m).
 - **CENO-P** — MSA post-trained (float32), for **variant-effect scoring** (see [`vep/`](vep)).
   Three sizes (300M / 600M / 1B), e.g. [`CladeTeam/CENO-P-600M`](https://huggingface.co/CladeTeam/CENO-P-600M).
 
