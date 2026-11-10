@@ -84,19 +84,47 @@ published checkpoint has the same coverage. The README records the tested limits
 
 ## Measured performance
 
-Same H200, same 1B c2 weights, one full-length warm-up and median of three runs.
-Throughput includes prefill and decode, excludes model loading/compilation;
-batch-eight values count all generated tokens. The baseline is the previous
-shared implementation, which had numerical errors.
+One NVIDIA H200, vLLM 0.15.1, BF16, TP=1, concurrency 1, greedy, random DNA
+prompts. Output tokens per second over the whole request (prefill + decode),
+excluding model loading and compilation; each point is a single measurement
+(input scaling: 3 requests after 1 warm-up, 512 generated tokens; decode: 1
+request from a 1024-token prompt). Values within about 10% should not be read
+as real differences.
 
-| Prefix tokens | Batch | Generated tokens per request | Previous tokens/s | Current tokens/s | Change |
-|---:|---:|---:|---:|---:|---:|
-| 512 | 1 | 1024 | 441.75 | 361.27 | -18.2% |
-| 512 | 8 | 1024 | 2846.00 | 2451.51 | -13.9% |
-| 8192 | 1 | 1024 | 373.96 | 293.57 | -21.5% |
-| 8192 | 8 | 1024 | 2335.82 | 1726.41 | -26.1% |
-| 131072 | 1 | 256 | 84.53 | 74.44 | -11.9% |
+| Model | Workload | Default (fast) | `--exact` | fast / exact |
+|---|---|---:|---:|---:|
+| 80M | 8192-token prefix | 899 | 758 | 1.19x |
+| 80M | 131072-token prefix | 745 | 260 | 2.86x |
+| 80M | decode to 131072 tokens | 931 | 412 | 2.26x |
+| 300M | 8192-token prefix | 813 | 638 | 1.27x |
+| 300M | 131072-token prefix | 654 | 171 | 3.82x |
+| 300M | decode to 131072 tokens | 834 | 292 | 2.86x |
+| 600M | 8192-token prefix | 741 | 424 | 1.75x |
+| 600M | 131072-token prefix | 494 | 121 | 4.07x |
+| 600M | decode to 131072 tokens | 819 | 214 | 3.82x |
+| 1.3B | 8192-token prefix | 575 | 261 | 2.21x |
+| 1.3B | 131072-token prefix | 286 | 91.4 | 3.13x |
+| 1.3B | decode to 131072 tokens | 533 | 141 | 3.79x |
+| 9B | 8192-token prefix | 210 | 204 | 1.03x |
+| 9B | 131072-token prefix | 74.3 | 56.9 | 1.31x |
+| 9B | decode to 131072 tokens | 204 | 132 | 1.55x |
 
-At the 131072-token prefix, decode alone improves from 110.87 to 118.14 tokens/s
-(+6.6%); time to first token increases from 0.728 to 1.281 seconds. These numbers
-are workload-specific and do not imply unchanged throughput for all models.
+Short decodes (8192 tokens in total) can be slower in the default mode for the
+smallest and largest models (80M: 669 vs 849; 9B: 196 vs 216 tokens/s).
+
+## Accuracy of the default mode
+
+Measured against `--exact` on the public 80M, 1.3B and 9B checkpoints:
+
+- Next-base log-probabilities over phiX174 and four 131072-bp human windows:
+  mean absolute difference at most 0.016 nats per position, top-1 agreement at
+  least 99.1%, sequence NLL within 1.4e-4 nats. Individual positions can differ
+  more (largest probability difference 0.57; differences above 0.1 at no more
+  than 0.08% of positions).
+- Zero-shot variant scoring (ClinVar chr8 test split, TraitGym Mendelian) and
+  natural gene continuation: paired differences had 95% confidence intervals
+  that include zero, i.e. no difference was detected at these sample sizes.
+  This is not a proof of equivalence.
+
+The default mode is approximately equal to `--exact`, not bitwise identical.
+Use `--exact` when per-position scores or identical outputs across runs matter.
