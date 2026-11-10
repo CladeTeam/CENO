@@ -509,7 +509,17 @@ class CENOMamba2Mixer(nn.Module):
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             # MODIFIED: Always use training path (conv1d isolated) for inference
-            if cache_params is None:
+            # The fused kernel cannot re-zero pad positions after the convolution, where the conv
+            # bias makes them non-zero again and they would enter the SSM state of later tokens.
+            # Masks that are all ones or pad only at the end (right padding) are safe under causal
+            # computation; any other mask (left padding, masked positions inside a sequence) takes
+            # the unfused path below, which masks after the convolution.
+            pads_before_real_tokens = (
+                attention_mask is not None
+                and attention_mask.shape[1] > 1
+                and not bool(torch.all(attention_mask[:, 1:] <= attention_mask[:, :-1]))
+            )
+            if cache_params is None and not pads_before_real_tokens:
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -553,11 +563,13 @@ class CENOMamba2Mixer(nn.Module):
                         self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
                     )
                 else:
+                    conv_kwargs = {} if seq_idx is None else {"seq_idx": seq_idx.contiguous()}  # keep segments isolated
                     hidden_states_B_C = causal_conv1d_fn(
                         x=hidden_states_B_C.transpose(1, 2),
                         weight=self.conv1d.weight.squeeze(1),
                         bias=self.conv1d.bias,
                         activation=self.activation,
+                        **conv_kwargs,
                     ).transpose(1, 2)
                 hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
                 hidden_states, B, C = torch.split(
