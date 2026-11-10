@@ -26,13 +26,32 @@ The patcher modifies the runtime and container-local vLLM, never source weights.
 Do not use hardlinked runtime copies. Keep all generation helpers beside the
 patcher. CENO-P is an HF MSA scorer, not a vLLM generation checkpoint.
 
-For a custom Python integration, follow the initialization in
-`vllm_offline_infer.py`, including `install_training_precision()` and its engine
-settings. A direct `LLM(...)` call after patching does not inherit the CLI setup.
+For a custom Python integration, reuse `engine_kwargs()` from
+`vllm_offline_infer.py` (put `--exact` in `sys.argv` before importing the module
+to select the exact path). A direct `LLM(...)` call after patching does not
+inherit the CLI setup.
 
-## Numerical contract
+## Engine modes
 
-The corrected path uses FP32 Mamba state, training-order gating and MoE weighting,
+`vllm_offline_infer.py` has two modes. Both use the same patched model code
+(training-order gating and MoE weighting, normalization fixes) and FP32 Mamba state.
+
+| | default (fast) | `--exact` |
+|---|---|---|
+| Use for | generation, scoring and benchmarks where results only need to be close to the reference | reproducing reference logits bit for bit, regression tests, debugging numerical differences |
+| `VLLM_BATCH_INVARIANT` | off | on (fixed scan reductions) |
+| Training-precision arithmetic | off | on when the checkpoint enables it |
+| Attention backend | chosen by vLLM | fixed (FA2 under training precision) |
+| Async scheduling, compilation | vLLM defaults (on) | off |
+| Bitwise guarantee | **none**: results can differ slightly with batch composition, run and engine | as described under Numerical contract |
+
+The fast mode is the default because the measured differences to `--exact` are
+small (see the validation record of this change); it is not a bitwise-reproducible
+path. Use `--exact` whenever identical outputs across batches or runs matter.
+
+## Numerical contract (`--exact`)
+
+The exact path uses FP32 Mamba state, training-order gating and MoE weighting,
 fixed scan reductions, cache-owned chunk decode, fixed TE RMSNorm, and ordinary
 FA2 attention with an explicit CP reference. CP1 and CP8 Megatron references are
 not bitwise interchangeable. `ceno_reference_context_length` is fixed per model,
@@ -40,8 +59,8 @@ never derived from the current batch or prefix.
 
 Current precision support: BF16 CENO widths 512/1024, Mamba heads 16/32,
 attention heads 8/16, TP=PP=1, no quantization, prefix caching or speculation.
-Decode CUDA Graphs remain enabled; asynchronous scheduling and whole-model
-compilation are disabled. The CLI defaults to eight simultaneous requests; use `--max-num-seqs` to change it.
+In `--exact` mode decode CUDA Graphs remain enabled; asynchronous scheduling and
+whole-model compilation are disabled. The CLI defaults to eight simultaneous requests; use `--max-num-seqs` to change it.
 Other architectures keep their ordinary compatible implementation and are not
 labeled training-precision validated. CENO-P uses the separate HF MSA path.
 

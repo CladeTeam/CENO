@@ -139,6 +139,8 @@ The corrected numerical reference was tested on **NVIDIA H200**, with one GPU, B
 and the pinned environments described in [generation](generation/README.md). Other
 GPU/build combinations are not covered by the bitwise guarantee. CPU supports small
 smoke tests. Multi-GPU placement is outside the corrected precision contract.
+vLLM generation defaults to a faster mode without the bitwise guarantee; pass
+`--exact` for the reference path (see [engine modes](generation/README.md#engine-modes)).
 
 ### Inference with HuggingFace (bfloat16)
 

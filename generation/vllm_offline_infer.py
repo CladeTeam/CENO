@@ -12,26 +12,74 @@ import os
 import sys
 import time
 
-os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
-# Read by vLLM at import time. Explicit VLLM_BATCH_INVARIANT=0 keeps the legacy path.
-os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+# Two engine modes (chosen before vLLM is imported, because vLLM reads these at import time):
+#   default (fast): vLLM's own attention backend selection, asynchronous scheduling and
+#       compilation, FP32 Mamba state and the CENO model-code fixes from the patcher.
+#       Results are close to --exact but are NOT guaranteed bitwise identical across
+#       batch composition, runs or engines.
+#   --exact: the batch-invariant reference path (VLLM_BATCH_INVARIANT, fixed scan
+#       reductions, FA2, and training-precision arithmetic when the checkpoint enables it).
+EXACT = "--exact" in sys.argv[1:]
 _checkpoint_precision = False
-if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-    config_path = Path(sys.argv[1]) / "config.json"
-    if config_path.is_file():
-        _checkpoint_precision = bool(json.loads(config_path.read_text()).get("ceno_training_precision"))
-if _checkpoint_precision or "--training-precision" in sys.argv:
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+if EXACT:
+    os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+    # Read by vLLM at import time. Explicit VLLM_BATCH_INVARIANT=0 keeps the legacy path.
+    os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        config_path = Path(sys.argv[1]) / "config.json"
+        if config_path.is_file():
+            _checkpoint_precision = bool(json.loads(config_path.read_text()).get("ceno_training_precision"))
+    if _checkpoint_precision or "--training-precision" in sys.argv:
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-# Configure Triton before importing the engine/compilation machinery.
-from vllm.model_executor.layers.ceno_mamba import configure_invariant_scan
+    # Configure Triton before importing the engine/compilation machinery.
+    from vllm.model_executor.layers.ceno_mamba import configure_invariant_scan
 
-configure_invariant_scan()
+    configure_invariant_scan()
 
 from vllm import LLM, SamplingParams
 
 
-def main():
+def engine_kwargs(args, num_prompts):
+    """LLM(...) keyword arguments for the selected mode (fast default or --exact).
+
+    Custom integrations can call this after importing this module; the module
+    import itself applies the mode's environment settings, so put ``--exact`` in
+    ``sys.argv`` before importing it to select the exact path.
+    """
+    if args.exact != EXACT:
+        raise ValueError("--exact must be chosen before this module is imported")
+    llm_kwargs = dict(
+        model=args.model_dir,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tp,
+        enable_prefix_caching=False,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+    )
+    if args.exact:
+        llm_kwargs.update(
+            attention_config={"backend": os.environ["VLLM_ATTENTION_BACKEND"]},
+            # Keep graph replay speed without compiler-dependent BF16 arithmetic.
+            compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
+        )
+    else:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+    if args.kv_cache_dtype != "auto":
+        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+        llm_kwargs["calculate_kv_scales"] = True
+    if args.training_precision:
+        from vllm.model_executor.layers.ceno_precision import install_training_precision
+        install_training_precision()
+        llm_kwargs.update(attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 2},
+                          async_scheduling=False, max_num_seqs=min(args.max_num_seqs, num_prompts))
+    return llm_kwargs
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="DNA NemotronH offline inference")
     parser.add_argument("model_dir", help="Path to HF checkpoint directory")
     parser.add_argument("--prompts", type=str, default=None,
@@ -50,10 +98,20 @@ def main():
     parser.add_argument("--mamba-ssm-cache-dtype", choices=("float32", "auto", "float16"),
                         default="float32",
                         help="SSM recurrent state precision; FP32 prevents long-decode BF16 drift")
+    parser.add_argument("--exact", action="store_true",
+                        help="Batch-invariant reference path (slower). Default is the fast path, which is close "
+                             "to --exact but not guaranteed bitwise identical across batches or runs.")
     parser.add_argument("--training-precision", action="store_true", default=_checkpoint_precision,
-                        help="CENO training arithmetic (enabled by checkpoint configuration); requires prepared TE norm and "
-                             "training-gate runtime. Uses extra KV staging memory and bandwidth.")
+                        help="With --exact: CENO training arithmetic (enabled by checkpoint configuration); requires "
+                             "prepared TE norm and training-gate runtime. Uses extra KV staging memory and bandwidth.")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    if args.training_precision and not args.exact:
+        parser.error("--training-precision requires --exact")
     if args.max_num_seqs < 1:
         parser.error("--max-num-seqs must be positive")
 
@@ -76,32 +134,12 @@ def main():
     sampling_params = SamplingParams(**sp_kwargs)
 
     # Create LLM
-    llm_kwargs = dict(
-        model=args.model_dir,
-        trust_remote_code=True,
-        dtype="bfloat16",
-        attention_config={"backend": os.environ["VLLM_ATTENTION_BACKEND"]},
-        max_model_len=args.max_model_len,
-        tensor_parallel_size=args.tp,
-        enable_prefix_caching=False,
-        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
-        # Keep graph replay speed without compiler-dependent BF16 arithmetic.
-        compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
-    )
-    if args.quantization:
-        llm_kwargs["quantization"] = args.quantization
-    if args.kv_cache_dtype != "auto":
-        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
-        llm_kwargs["calculate_kv_scales"] = True
-    if args.training_precision:
-        from vllm.model_executor.layers.ceno_precision import install_training_precision
-        install_training_precision()
-        llm_kwargs.update(attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 2},
-                          async_scheduling=False, max_num_seqs=min(args.max_num_seqs, len(prompts)))
+    llm_kwargs = engine_kwargs(args, num_prompts=len(prompts))
     llm = LLM(**llm_kwargs)
 
     # Generate with timing
-    print(f"\n>>> Generating {len(prompts)} sequences, max_tokens={args.max_tokens} ...")
+    print(f"\n>>> Engine mode: {'exact' if args.exact else 'fast'}")
+    print(f">>> Generating {len(prompts)} sequences, max_tokens={args.max_tokens} ...")
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
     elapsed = time.time() - t0
