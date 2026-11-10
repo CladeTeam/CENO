@@ -474,6 +474,76 @@ class CENOMamba2Mixer(nn.Module):
             return hidden_states
         return self.in_proj_norm(hidden_states.to(dtype=self.in_proj_norm.weight.dtype))
 
+    # The causal_conv1d CUDA kernel and the mamba_ssm Triton kernels compute element offsets in 32-bit
+    # integers. Their inputs are views into the in_proj output, whose rows are in_proj-width apart, so
+    # offsets wrap once batch * length * width reaches 2**31: the forward then reads wrong memory
+    # (silently, or as an illegal memory access).
+    _INT32_OFFSET_LIMIT = 2**31
+
+    def _prefill_segment_length(self, batch_size: int, seq_len: int) -> Optional[int]:
+        """None if the sequence fits the kernels in one pass, else a chunk-aligned segment length."""
+        width = self.intermediate_size + self.conv_dim + self.num_heads  # in_proj output width (widest view)
+        forced = getattr(self, "_ceno_prefill_segment", None)  # testing hook: force segmentation
+        if forced is None and batch_size * seq_len * width < self._INT32_OFFSET_LIMIT:
+            return None
+        segment = (self._INT32_OFFSET_LIMIT - 1) // (batch_size * width) // self.chunk_size * self.chunk_size
+        if forced is not None:
+            segment = min(segment, int(forced))
+        if segment < self.chunk_size or segment % self.chunk_size:
+            raise ValueError(f"cannot split a batch of {batch_size} for Mamba prefill; use a smaller batch")
+        return segment
+
+    def _conv_scan_norm(self, hidden_states_B_C, dt, gate, A, attention_mask, seq_idx, gate_in_ssm, dt_limit_kwargs,
+                        conv_tail=None, initial_states=None):
+        """Causal conv, SSM scan and gated RMSNorm over one span. ``conv_tail`` holds the previous
+        conv_kernel - 1 convolution inputs and ``initial_states`` the SSM state when continuing a sequence."""
+        batch_size, seq_len, _ = hidden_states_B_C.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+        if conv_tail is not None:
+            hidden_states_B_C = torch.cat([conv_tail, hidden_states_B_C], dim=1)
+        if self.activation not in ["silu", "swish"]:
+            hidden_states_B_C = self.act(
+                self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :hidden_states_B_C.shape[1]].transpose(1, 2)
+            )
+        else:
+            hidden_states_B_C = causal_conv1d_fn(
+                x=hidden_states_B_C.transpose(1, 2),
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+            ).transpose(1, 2)
+        if conv_tail is not None:
+            hidden_states_B_C = hidden_states_B_C[:, conv_tail.shape[1]:]
+        hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+        hidden_states, B, C = torch.split(
+            hidden_states_B_C,
+            [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+            dim=-1,
+        )
+
+        # 3. SSM transformation
+        scan_kwargs = {} if initial_states is None else {"initial_states": initial_states}
+        scan_output, ssm_state = mamba_chunk_scan_combined(
+            hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+            dt,
+            A,
+            B.view(batch_size, seq_len, self.n_groups, -1),
+            C.view(batch_size, seq_len, self.n_groups, -1),
+            chunk_size=self.chunk_size,
+            D=self.D,
+            z=gate.view(batch_size, seq_len, self.num_heads, self.head_dim) if gate_in_ssm else None,
+            seq_idx=seq_idx,
+            return_final_states=True,
+            dt_bias=self.dt_bias,
+            dt_softplus=True,
+            **scan_kwargs,
+            **dt_limit_kwargs,
+        )
+        scan_output = scan_output.view(batch_size, seq_len, -1)
+
+        # Multiply "gate" branch and apply extra normalization layer
+        return self.norm(scan_output, None if gate_in_ssm else gate), ssm_state
+
     def cuda_kernels_forward(
         self,
         hidden_states: torch.Tensor,
@@ -591,49 +661,37 @@ class CENOMamba2Mixer(nn.Module):
                         layer_idx=self.layer_idx, new_conv_state=conv_states, cache_init=True
                     )
 
-                if self.activation not in ["silu", "swish"]:
-                    hidden_states_B_C = self.act(
-                        self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+                segment = self._prefill_segment_length(batch_size, seq_len)
+                if segment is None:
+                    scan_output, ssm_state = self._conv_scan_norm(
+                        hidden_states_B_C, dt, gate, A, attention_mask, seq_idx, gate_in_ssm, dt_limit_kwargs
                     )
                 else:
-                    hidden_states_B_C = causal_conv1d_fn(
-                        x=hidden_states_B_C.transpose(1, 2),
-                        weight=self.conv1d.weight.squeeze(1),
-                        bias=self.conv1d.bias,
-                        activation=self.activation,
-                    ).transpose(1, 2)
-                hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
-                hidden_states, B, C = torch.split(
-                    hidden_states_B_C,
-                    [self.intermediate_size, groups_time_state_size, groups_time_state_size],
-                    dim=-1,
-                )
-
-                # 3. SSM transformation
-                scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-                    dt,
-                    A,
-                    B.view(batch_size, seq_len, self.n_groups, -1),
-                    C.view(batch_size, seq_len, self.n_groups, -1),
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=gate.view(batch_size, seq_len, self.num_heads, self.head_dim) if gate_in_ssm else None,
-                    seq_idx=seq_idx,
-                    return_final_states=True,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
-                    **dt_limit_kwargs,
-                )
+                    # Sequences whose (batch, length, heads * head_dim) tensors exceed int32 offsets in the
+                    # Triton kernels are processed in chunk-aligned segments, carrying the convolution inputs
+                    # and the SSM state across segment boundaries (the same recurrence as one pass).
+                    if seq_idx is not None:
+                        raise ValueError(f"seq_idx is not supported for Mamba prefill longer than {segment} tokens")
+                    pieces, ssm_state, tail = [], None, None
+                    for start in range(0, seq_len, segment):
+                        end = min(start + segment, seq_len)
+                        # A contiguous copy gives the kernels the layout of an ordinary short forward.
+                        _, _, gate_s, hidden_states_B_C_s, dt_s = projected_states[:, start:end].contiguous().split(
+                            [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+                        )
+                        piece, ssm_state = self._conv_scan_norm(
+                            hidden_states_B_C_s, dt_s, gate_s, A,
+                            None if attention_mask is None else attention_mask[:, start:end], None, gate_in_ssm,
+                            dt_limit_kwargs, conv_tail=tail, initial_states=ssm_state,
+                        )
+                        pieces.append(piece)
+                        tail = hidden_states_B_C_s[:, -(self.conv_kernel_size - 1):]
+                    scan_output = torch.cat(pieces, dim=1)
+                    del pieces
 
                 # Init cache
                 if ssm_state is not None and cache_params is not None:
                     cache_params.update_ssm_state(layer_idx=self.layer_idx, new_ssm_state=ssm_state)
-
-                scan_output = scan_output.view(batch_size, seq_len, -1)
-
-                # Multiply "gate" branch and apply extra normalization layer
-                scan_output = self.norm(scan_output, None if gate_in_ssm else gate)
 
                 # 4. Final linear projection
                 out = self.out_proj(scan_output)

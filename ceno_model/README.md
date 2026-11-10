@@ -56,6 +56,17 @@ some PyTorch builds compute SDPA with masks of more than 2**32 elements incorrec
 **For sequences longer than 65536 tokens use `attn_implementation="flash_attention_2"`
 or the vLLM entry.** `seq_idx` segment masks require `sdpa` or `eager`.
 
+### Sequences longer than about 170k tokens
+
+With the Mamba CUDA kernels, Mamba prefill longer than 2**31 elements of the in-projection
+output (batch × length × in-projection width; about 173k tokens for 9B and 347k for 1.3B at
+batch size 1) runs in chunk-aligned segments that carry the convolution inputs and SSM state,
+because the `causal_conv1d` and `mamba_ssm` kernels use 32-bit offsets. Results are bitwise
+identical to a single pass. A single-sequence 9B forward of 1,048,576 tokens with
+FlashAttention-2 on one H200 takes about 92 s and 76 GiB. Shorter inputs are unchanged.
+The configured base precision path still stops at 131072 prefill tokens (see below); load
+with `ceno_training_precision=False` in the config, or use the vLLM entry, for longer inputs.
+
 ### Padded batches
 
 Pass the tokenizer's `attention_mask` with padded batches. Pad positions are

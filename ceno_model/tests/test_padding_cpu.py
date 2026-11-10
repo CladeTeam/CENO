@@ -45,6 +45,9 @@ def model_cls(request, monkeypatch):
     for name in ("ceno_hf.modeling_ceno", "ceno_hf.modeling_ceno_p", "ceno_hf.training_precision"):
         sys.modules.pop(name, None)
     modeling = importlib.import_module(f"ceno_hf.{request.param}")
+    # The gated RMSNorm calls mamba_ssm's Triton kernel whenever mamba_ssm is importable; these
+    # tests run the model on CPU, so use the PyTorch norm.
+    monkeypatch.setattr(modeling, "rmsnorm_fn", None, raising=False)
     return getattr(modeling, "CENOPForCausalLM" if request.param.endswith("_p") else "CENOForCausalLM")
 
 
