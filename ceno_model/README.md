@@ -33,6 +33,27 @@ cfg = CENOConfig.from_pretrained("<ckpt_dir>")
 model = CENOPForCausalLM.from_pretrained("<ckpt_dir>", config=cfg, torch_dtype="auto")
 ```
 
+## Attention implementation and long sequences
+
+When you do not pass `attn_implementation`, base CENO checkpoints
+(`CENOForCausalLM`) choose the attention implementation as follows; the choice is
+logged at info level (`transformers.logging.set_verbosity_info()` to see it).
+
+| Environment | Default attention |
+|---|---|
+| `flash-attn` installed, CUDA GPU with compute capability ≥ 8.0 (Ampere or newer), BF16/FP16 weights | `flash_attention_2` |
+| any condition above not met (no `flash-attn`, CPU-only, older GPU, FP32) | `sdpa` |
+| `attn_implementation=...` passed explicitly | the value you passed |
+| CENO-P (`CENOPForCausalLM`) | unchanged (`sdpa` unless passed); its MSA segment masks need an explicit mask |
+
+With `sdpa` (and `eager`, which also calls SDPA in this implementation), inputs
+without padding use causal attention without an explicit mask.
+An explicit mask is still needed for padded batches, `seq_idx` segments and cached
+chunks; for sequences longer than 65536 tokens that case raises an error, because
+some PyTorch builds compute SDPA with masks of more than 2**32 elements incorrectly.
+**For sequences longer than 65536 tokens use `attn_implementation="flash_attention_2"`
+or the vLLM entry.** `seq_idx` segment masks require `sdpa` or `eager`.
+
 ## CUDA kernels and VEP settings
 
 These are read by the VEP adapter:

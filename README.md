@@ -141,6 +141,9 @@ GPU/build combinations are not covered by the bitwise guarantee. CPU supports sm
 smoke tests. Multi-GPU placement is outside the corrected precision contract.
 vLLM generation defaults to a faster mode without the bitwise guarantee; pass
 `--exact` for the reference path (see [engine modes](generation/README.md#engine-modes)).
+For HF inference on sequences longer than 65536 tokens, use FlashAttention-2 (the
+default when `flash-attn` is installed) or vLLM; see
+[attention implementation](ceno_model/README.md#attention-implementation-and-long-sequences).
 
 ### Inference with HuggingFace (bfloat16)
 

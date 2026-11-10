@@ -1686,7 +1686,8 @@ class CENOModel(CENOPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position,
+                                               needs_explicit_mask=seq_idx is not None)
         mamba_mask = self._update_mamba_mask(attention_mask, cache_position)
         if seq_idx is not None:
             seq_idx = seq_idx.to(device=hidden_states.device, dtype=torch.int32)
@@ -1771,7 +1772,7 @@ class CENOModel(CENOPreTrainedModel):
         )
 
     # Copied from transformers.models.jamba.modeling_jamba.JambaModel._update_causal_mask
-    def _update_causal_mask(self, attention_mask, input_tensor, cache_position):
+    def _update_causal_mask(self, attention_mask, input_tensor, cache_position, needs_explicit_mask=False):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
@@ -1780,7 +1781,22 @@ class CENOModel(CENOPreTrainedModel):
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
-        target_length = cache_position[-1] + 1
+        target_length = int(cache_position[-1]) + 1
+
+        # "eager" here also calls SDPA (see CENOAttention.forward), so it shares the mask handling.
+        if self.config._attn_implementation in ("sdpa", "eager") and not needs_explicit_mask:
+            unpadded = attention_mask is None or bool(torch.all(attention_mask == 1))
+            if unpadded and sequence_length in (1, target_length):
+                # Full prefill or single-token decode without padding: SDPA's is_causal=True
+                # (or no mask for one query) is exact and avoids an L x L mask. Explicit masks
+                # larger than 2**32 elements are mis-indexed by some PyTorch SDPA builds.
+                return None
+        if self.config._attn_implementation in ("sdpa", "eager") and sequence_length * target_length > 2**32:
+            raise ValueError(
+                f"SDPA would need an explicit {sequence_length}x{target_length} attention mask (padding, "
+                "segment ids or a cached chunk), which exceeds 2**32 elements and is computed incorrectly by "
+                "some PyTorch builds. Load the model with attn_implementation=\"flash_attention_2\" or use the "
+                "vLLM entry for sequences longer than 65536 tokens.")
 
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
