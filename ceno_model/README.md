@@ -47,12 +47,26 @@ logged at info level (`transformers.logging.set_verbosity_info()` to see it).
 | CENO-P (`CENOPForCausalLM`) | unchanged (`sdpa` unless passed); its MSA segment masks need an explicit mask |
 
 With `sdpa` (and `eager`, which also calls SDPA in this implementation), inputs
-without padding use causal attention without an explicit mask.
-An explicit mask is still needed for padded batches, `seq_idx` segments and cached
-chunks; for sequences longer than 65536 tokens that case raises an error, because
+without padding, and right-padded batches (the tokenizer default), use causal
+attention without an explicit mask.
+An explicit mask is still needed for left padding, masked positions inside a
+sequence, `seq_idx` segments and cached chunks; for sequences longer than 65536
+tokens that case raises an error, because
 some PyTorch builds compute SDPA with masks of more than 2**32 elements incorrectly.
 **For sequences longer than 65536 tokens use `attn_implementation="flash_attention_2"`
 or the vLLM entry.** `seq_idx` segment masks require `sdpa` or `eager`.
+
+### Padded batches
+
+Pass the tokenizer's `attention_mask` with padded batches. Pad positions are
+excluded from the Mamba convolution and state and from attention, for any batch
+size and either padding side, so in FP32 the real tokens of a padded sequence
+match the unpadded run up to rounding. In BF16, left padding and masked positions
+inside a sequence run attention through a different kernel than an unpadded
+sequence, so results can differ from a single-sequence run by BF16 rounding (the
+same order as BF16 vs FP32). The configured base CUDA BF16 precision path accepts
+only unpadded uniform-length batches and raises an error otherwise. For results
+that are bitwise independent of batch composition use the vLLM entry with `--exact`.
 
 ## CUDA kernels and VEP settings
 

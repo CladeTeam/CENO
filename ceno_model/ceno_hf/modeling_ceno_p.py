@@ -173,8 +173,11 @@ def segment_sum(input_tensor):
 def apply_mask_to_padding_states(hidden_states, attention_mask):
     """
     Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+
+    Applied for any batch size: a single left-padded sequence needs it as much as a batch does,
+    otherwise the pad positions feed the convolution and the SSM state of the real tokens.
     """
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+    if attention_mask is not None and attention_mask.shape[1] > 1:
         dtype = hidden_states.dtype
         hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
 
@@ -802,7 +805,7 @@ class CENOMamba2Mixer(nn.Module):
                 "CENO-P MSA scoring requires the Mamba CUDA kernels: the PyTorch fallback "
                 "cannot preserve per-segment Mamba state resets. Install mamba-ssm and causal-conv1d."
             )
-        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        if attention_mask is not None and attention_mask.shape[1] > 1:
             # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
             hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
 
@@ -1790,6 +1793,14 @@ class CENOModel(CENOPreTrainedModel):
                 # Full prefill or single-token decode without padding: SDPA's is_causal=True
                 # (or no mask for one query) is exact and avoids an L x L mask. Explicit masks
                 # larger than 2**32 elements are mis-indexed by some PyTorch SDPA builds.
+                return None
+            if (attention_mask is not None and attention_mask.dim() == 2 and sequence_length == target_length
+                    and attention_mask.shape[-1] == target_length
+                    and bool(torch.all(attention_mask[:, 1:] <= attention_mask[:, :-1]))):
+                # Right padding only (the tokenizer default), full prefill: under causal attention no
+                # real token can see a pad that follows it, so is_causal=True gives the real tokens
+                # exactly the attention of the unpadded run (same kernel as a single sequence). Pad
+                # positions get finite values that callers ignore; Mamba layers still zero them.
                 return None
         if self.config._attn_implementation in ("sdpa", "eager") and sequence_length * target_length > 2**32:
             raise ValueError(
